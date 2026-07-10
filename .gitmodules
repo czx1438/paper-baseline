@@ -1,0 +1,3 @@
+[submodule "T-Gated-Adapter"]
+	path = T-Gated-Adapter
+	url = https://github.com/pranzalkhadka/T-Gated-Adapter.git

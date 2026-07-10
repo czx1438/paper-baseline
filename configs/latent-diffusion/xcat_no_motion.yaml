@@ -1,0 +1,87 @@
+model:
+  base_learning_rate: 2.0e-06
+  target: ldm.models.diffusion.ddpm.LatentDiffusion
+  params:
+    linear_start: 0.0015
+    linear_end: 0.0195
+    num_timesteps_cond: 1
+    log_every_t: 200
+    timesteps: 1000
+    first_stage_key: image
+    image_size: 128
+    channels: 1
+    cond_stage_trainable: false
+    concat_mode: false
+    monitor: val/loss
+    scale_by_std: true
+    unet_config:
+      target: ldm.modules.diffusionmodules.openaimodel.UNetModel
+      params:
+        image_size: 128
+        in_channels: 1
+        out_channels: 1
+        model_channels: 64
+        attention_resolutions:
+        - 8
+        - 4
+        - 2
+        num_res_blocks: 2
+        channel_mult:
+        - 1
+        - 2
+        - 3
+        - 4
+        num_head_channels: 32
+    first_stage_config:
+      target: ldm.models.autoencoder.VQModelInterface
+      params:
+        ckpt_path: /root/autodl-tmp/LDM-Morph-main/LDM-Morph-main/logs/2026-07-10T12-16-38_xcat-vq16-block0135/checkpoints/epoch=000023.ckpt
+        embed_dim: 1
+        n_embed: 16384
+        monitor: val/rec_loss
+        ddconfig:
+          double_z: false
+          z_channels: 1
+          resolution: 512
+          in_channels: 1
+          out_ch: 1
+          ch: 128
+          ch_mult:
+          - 1
+          - 2
+          - 4
+          num_res_blocks: 2
+          attn_resolutions:
+          - 32
+          dropout: 0.0
+        lossconfig:
+          target: taming.modules.losses.vqperceptual.VQLPIPSWithDiscriminator
+          params:
+            disc_conditional: false
+            disc_in_channels: 1
+            disc_start: 40001
+            disc_weight: 0.75
+            codebook_weight: 1.0
+    cond_stage_config: __is_unconditional__
+data:
+  target: main.DataModuleFromConfig
+  params:
+    batch_size: 5
+    num_workers: 4
+    wrap: true
+    train:
+      target: ldm.data.xcat_npz.XCATNPZVQTrain
+    validation:
+      target: ldm.data.xcat_npz.XCATNPZVQValidation
+    test:
+      target: ldm.data.xcat_npz.XCATNPZVQTest
+    
+lightning:
+  callbacks:
+    image_logger:
+      target: main.ImageLogger
+      params:
+        batch_frequency: 500
+        max_images: 4
+        increase_log_steps: false
+        rescale: false

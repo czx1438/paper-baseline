@@ -1,0 +1,11 @@
+# Ignore large files / generated artifacts
+
+# Training logs (checkpoints, image logs, tensorboard, etc.)
+logs/
+
+# Large data directories
+ruis_SEY_all_coronal/
+vis_result/
+visualizations/
+xcat_data/
+datasets/
