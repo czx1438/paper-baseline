@@ -240,6 +240,48 @@ class MultiPhaseDataset(Dataset):
             "slice_id":    slice_id,
         }
 
+class PairwisePhaseDataset(MultiPhaseDataset):
+    def __len__(self):
+        return self.num_base * self.num_phases
+
+    def __getitem__(self, idx):
+        base_idx, phase_idx = divmod(idx, self.num_phases)
+        block_id, slice_id = self.base_samples[base_idx]
+
+        moving_np = self._load_npy(
+            self._raw_index(block_id, phase_idx, slice_id),
+            self.moving_dir,
+        )
+        fixed_np = self._load_npy(
+            self._raw_index(block_id, 0, slice_id),
+            self.fixed_dir,
+        )
+
+        if self.normalize:
+            minv, maxv = fixed_np.min(), fixed_np.max()
+            if maxv - minv > 1e-6:
+                fixed_np = (fixed_np - minv) / (maxv - minv)
+                moving_np = (moving_np - minv) / (maxv - minv)
+
+        if self.flip_p > 0 and np.random.rand() < self.flip_p:
+            fixed_np = np.fliplr(fixed_np).copy()
+            moving_np = np.fliplr(moving_np).copy()
+
+        return {
+            "fixed": torch.from_numpy(fixed_np).float().unsqueeze(0),
+            "moving": torch.from_numpy(moving_np).float().unsqueeze(0),
+            "phase_id": torch.tensor(phase_idx, dtype=torch.long),
+            "pairname": f"block{block_id}_slice{slice_id:02d}_phase{phase_idx+1}",
+            "block_id": block_id,
+            "slice_id": slice_id,
+        }
+        
+def collate_pairwise(batch):
+    fixed = torch.stack([x["fixed"] for x in batch])
+    moving = torch.stack([x["moving"] for x in batch])
+    phase_id = torch.stack([x["phase_id"] for x in batch])
+    names = [x["pairname"] for x in batch]
+    return fixed, moving, phase_id, names
 
 def collate_multiphase(batch: List[dict]):
     """
