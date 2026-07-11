@@ -13,14 +13,18 @@ Multi-phase dataset for MotionFiLM multi-phase training.
     raw_idx       = block_id * 171 + phase_id * 19 + slice_id     # phase_id=0..8
     文件命名      = {idx:03d}.npy
 
-Split 划分 (与 xcat_npz.py 完全一致):
-    按 base_sample (= block_id * 19 + slice_id, 共 114 个) 70/15/15 划分;
-    同一个 base_sample 的 9 个 phase 必然属于同一个 split,
-    避免信息泄露。
+Split 划分 (block_id 硬切, 避免信息泄露):
+    train_blocks = {0, 1, 3, 5}
+    val_blocks   = {2}
+    test_blocks  = {4}
+
+    同一个 block 内所有 19 个 slice 同时进入同一个 split;
+    注册用 fixed/moving 完全独立于 block 边界，0 信息泄露。
+    若想恢复旧的 base-sample 70/15/15 划分：传入 split_file=.../legacy_split.json。
 """
 import json
 import os
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 import numpy as np
 import torch
@@ -30,6 +34,13 @@ from torch.utils.data import Dataset
 NUM_PHASES = 9              # phase 1..9 = moving
 SLICES_PER_PHASE = 19
 BLOCK_SIZE = NUM_PHASES * SLICES_PER_PHASE   # 171
+
+# ---- 按 block_id 硬切的默认 split（你这次训练的新划分） ----
+DEFAULT_BLOCK_SPLIT: Dict[str, set] = {
+    "train": {0, 1, 3, 5},
+    "val":   {2},
+    "test":  {4},
+}
 
 
 class MultiPhaseDataset(Dataset):
@@ -48,6 +59,7 @@ class MultiPhaseDataset(Dataset):
         flip_p: float = 0.5,
         normalize: bool = True,
         split_file: Optional[str] = None,
+        block_split: Optional[Dict[str, set]] = None,
         num_blocks: int = 6,
         total_files: int = 1026,
     ):
@@ -59,66 +71,118 @@ class MultiPhaseDataset(Dataset):
         self.fixed_dir = os.path.join(self.data_root, "fixed", "fixed")
         self.moving_dir = os.path.join(self.data_root, "moving", "moving")
 
-        # base-sample split (与 XCATNPZRegistration 保持完全一致)
-        if split_file is None:
-            split_file = os.path.join(self.data_root, "registration_multi_phase_split.json")
-
-        if os.path.exists(split_file):
-            with open(split_file) as f:
-                cfg = json.load(f)
-            info = cfg.get("registration_multi_phase", {})
-            split_conf = info.get("split", {})
-            train_range = split_conf.get("train", [0, 79])
-            val_range   = split_conf.get("val",   [80, 96])
-            test_range  = split_conf.get("test",  [97, 113])
-            nb = info.get("num_blocks", num_blocks)
-            total_f = info.get("total_files", total_files)
-        else:
-            train_range = [0, 79]
-            val_range   = [80, 96]
-            test_range  = [97, 113]
-            nb = num_blocks
-            total_f = total_files
-
-        if split == "train":
-            self.base_range = range(train_range[0], train_range[1] + 1)
-        elif split == "val":
-            self.base_range = range(val_range[0], val_range[1] + 1)
-        else:
-            self.base_range = range(test_range[0], test_range[1] + 1)
-
-        self.num_blocks = nb
-        self.total_files = total_f
+        self.num_blocks = num_blocks
+        self.total_files = total_files
         self.num_phases = NUM_PHASES
 
-        # 每个 block 在 base-sample 索引中占 19 个位置
-        self.base_samples: List[tuple] = []
-        for b in range(nb):
+        # ------------------------------------------------------------------
+        # 1. 解析 split 划分
+        #    优先级: 用户显式传入的 block_split > JSON split_file > 默认硬切
+        # ------------------------------------------------------------------
+        if block_split is not None:
+            self.block_split = {k: set(int(x) for x in v)
+                                for k, v in block_split.items()}
+            self.split_source = "explicit-kwarg"
+        else:
+            split_file = split_file or os.path.join(
+                self.data_root, "registration_multi_phase_split.json"
+            )
+            if os.path.exists(split_file):
+                with open(split_file) as f:
+                    cfg = json.load(f)
+                info = cfg.get("registration_multi_phase", {})
+                split_conf = info.get("split", {})
+                self.num_blocks = info.get("num_blocks", num_blocks)
+                self.total_files = info.get("total_files", total_files)
+                # 仅当 JSON 中存在 block-keyed 字段才用 block 切分，
+                # 否则 fallback 到基于 base-range 的旧逻辑并转 block set。
+                if split_conf and "blocks" in split_conf:
+                    bmap = split_conf["blocks"]
+                    self.block_split = {
+                        k: set(int(x) for x in v)
+                        for k, v in bmap.items() if v
+                    }
+                    self.split_source = f"json:blocks {split_file}"
+                else:
+                    self.block_split = self._legacy_range_to_blocks(
+                        train_range=split_conf.get("train", [0, 79]),
+                        val_range=split_conf.get("val",   [80, 96]),
+                        test_range=split_conf.get("test",  [97, 113]),
+                    )
+                    self.split_source = f"json:legacy-ranges {split_file}"
+            else:
+                self.block_split = {k: set(v) for k, v in DEFAULT_BLOCK_SPLIT.items()}
+                self.split_source = "DEFAULT_BLOCK_SPLIT (hardcoded)"
+
+        if split not in self.block_split:
+            raise ValueError(
+                f"Unknown split '{split}'. Available: {list(self.block_split)}"
+            )
+        self.blocks: set = self.block_split[split]
+
+        # ------------------------------------------------------------------
+        # 2. 构建 base_samples：枚举所有 (block, slice)，
+        #    只保留属于当前 split 的 block 的样本
+        # ------------------------------------------------------------------
+        all_samples: List[tuple] = []
+        for b in range(self.num_blocks):
             for s in range(SLICES_PER_PHASE):
                 raw_idx = b * BLOCK_SIZE + s
-                if raw_idx < total_f:
-                    self.base_samples.append((b, s))
+                if raw_idx < self.total_files:
+                    all_samples.append((b, s))
                 else:
                     break
 
-        # 只保留属于当前 split 的 base_samples
-        self.base_samples = [
-            bs for bs in self.base_samples
-            if self._base_idx(bs) in self.base_range
+        self.base_samples: List[tuple] = [
+            (b, s) for (b, s) in all_samples if b in self.blocks
         ]
         self.num_base = len(self.base_samples)
 
+        # blocks 内样本为 0 时立刻报错（避免悄悄训空集）
+        if self.num_base == 0:
+            raise RuntimeError(
+                f"[MultiPhaseDataset] split='{split}' 在 {self.blocks} 内没有样本。\n"
+                f"  data_root={self.data_root}\n"
+                f"  num_blocks={self.num_blocks}, total_files={self.total_files}\n"
+                f"  split_source={self.split_source}"
+            )
+
+        blocks_str = "{" + ",".join(str(b) for b in sorted(self.blocks)) + "}"
         print(
-            f"[MultiPhaseDataset] split={split}  base_samples={self.num_base}  "
-            f"phases_per_base={self.num_phases}  normalize={normalize}  flip_p={self.flip_p}"
+            f"[MultiPhaseDataset] split={split:<5}  base_samples={self.num_base}  "
+            f"phases_per_base={self.num_phases}  blocks={blocks_str}  "
+            f"normalize={normalize}  flip_p={self.flip_p}  "
+            f"split_src={self.split_source}"
         )
 
     # ------------------------------------------------------------------
     # helpers
     # ------------------------------------------------------------------
-    def _base_idx(self, bs: tuple) -> int:
+    def _legacy_range_to_blocks(
+        self,
+        train_range=(0, 79),
+        val_range=(80, 96),
+        test_range=(97, 113),
+    ) -> Dict[str, set]:
+        """把旧的 base-sample [lo, hi] 区间翻译成 block set，向后兼容旧 JSON。"""
+        def to_block_set(rng):
+            lo, hi = rng
+            return {b for b in range(self.num_blocks)
+                    if any(self._base_idx_global((b, s)) in range(lo, hi + 1)
+                           for s in range(SLICES_PER_PHASE))}
+        return {
+            "train": to_block_set(train_range),
+            "val":   to_block_set(val_range),
+            "test":  to_block_set(test_range),
+        }
+
+    @staticmethod
+    def _base_idx_global(bs: tuple) -> int:
         b, s = bs
         return b * SLICES_PER_PHASE + s
+
+    def _base_idx(self, bs: tuple) -> int:
+        return self._base_idx_global(bs)
 
     def _raw_index(self, block_id: int, phase_id: int, slice_id: int) -> int:
         """(block_id, phase_id, slice_id) → raw file index

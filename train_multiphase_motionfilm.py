@@ -277,6 +277,7 @@ def train():
     else:
         configs_list = ['/root/autodl-tmp/LDM-Morph-main/LDM-Morph-main/configs/latent-diffusion/xcat_motion-ldm.yaml']
     ldm_model, _ = load_ldm(opt, configs_list)
+    print('ldm_model loaded:',opt.ldm_ckpt)
     for p in ldm_model.parameters():
         p.requires_grad = False
     ldm_model.eval()
@@ -292,9 +293,23 @@ def train():
         batch_size=opt.bs, shuffle=False, num_workers=0,
         collate_fn=collate_multiphase,
     )
-    print(f"Multi-phase: train={len(train_loader.dataset)} base-samples, "
-          f"val={len(val_loader.dataset)} base-samples  "
-          f"×9 phases = {len(train_loader.dataset)*9} / {len(val_loader.dataset)*9} actual pairs")
+    test_loader = Data.DataLoader(
+        MultiPhaseDataset(data_root=opt.data_root, split='test', flip_p=0.0, normalize=True),
+        batch_size=opt.bs, shuffle=False, num_workers=0,
+        collate_fn=collate_multiphase,
+    )
+
+    # 打印汇总：base_samples × 9 phases = 实际 pair 数
+    n_train = len(train_loader.dataset)
+    n_val   = len(val_loader.dataset)
+    n_test  = len(test_loader.dataset)
+    print("=" * 72)
+    print(f"[Dataset Summary] (one base_sample = 1 fixed + 9 moving phases)")
+    print(f"  train: {n_train:3d} base_samples  ({n_train * 9:3d} actual pairs)  blocks={sorted(train_loader.dataset.blocks)}")
+    print(f"  val  : {n_val:3d} base_samples  ({n_val   * 9:3d} actual pairs)  blocks={sorted(val_loader.dataset.blocks)}")
+    print(f"  test : {n_test:3d} base_samples  ({n_test  * 9:3d} actual pairs)  blocks={sorted(test_loader.dataset.blocks)}")
+    print(f"  TOTAL: {n_train + n_val + n_test} base-samples  ({(n_train + n_val + n_test) * 9} pairs)")
+    print("=" * 72)
 
     # ----------- Model -----------
     model = LDMMorph(128*2, 192*2, 320*2, 448*2,
@@ -377,9 +392,10 @@ def train():
 
             # =========================================================
             # safety: phase_ids 范围必须是 0..8 (否则 phase_embedding 越界)
+            # 注: dataset 里 phase_ids 已经是 0..8 (内部索引), 不需要再 -1
             # =========================================================
-            assert phase_ids.min() >= 1 and phase_ids.max() <= 9, \
-                f"phase_ids out of expected range 1..9, got min={phase_ids.min().item()} max={phase_ids.max().item()}"
+            assert phase_ids.min() >= 0 and phase_ids.max() <= 8, \
+                f"phase_ids out of expected range 0..8, got min={phase_ids.min().item()} max={phase_ids.max().item()}"
 
             for i in range(P):
                 x_i = moving_seq_t[:, i]
@@ -388,8 +404,8 @@ def train():
                 score1_i = torch.cat([s1_moving[:, i], s1_fixed], dim=1)
                 score2_i = torch.cat([s2_moving[:, i], s2_fixed], dim=1)
                 score3_i = torch.cat([s3_moving[:, i], s3_fixed], dim=1)
-                # phase_embedding 需要 0..8；数据是 1..9，所以减 1
-                phase_i = phase_ids[:, i] - 1
+                # dataset 给的 phase_ids 已经是 0..8 (内部索引), 直接喂给 embedding
+                phase_i = phase_ids[:, i]
                 assert phase_i.min() >= 0 and phase_i.max() <= 8, \
                     f"phase_i after -1 out of range 0..8, got min={phase_i.min().item()} max={phase_i.max().item()}"
 
@@ -472,7 +488,7 @@ def train():
                 score1_i = torch.cat([s1_moving[:, i], s1_fixed], dim=1)
                 score2_i = torch.cat([s2_moving[:, i], s2_fixed], dim=1)
                 score3_i = torch.cat([s3_moving[:, i], s3_fixed], dim=1)
-                phase_i = phase_ids[:, i] - 1
+                phase_i = phase_ids[:, i]
 
                 D_f_xy, _ = model_forward_one_phase(
                     model, x_i, fixed_t,
@@ -527,7 +543,7 @@ def train():
                     s1_i = torch.cat([s1_moving[:, i], s1_fixed], dim=1)
                     s2_i = torch.cat([s2_moving[:, i], s2_fixed], dim=1)
                     s3_i = torch.cat([s3_moving[:, i], s3_fixed], dim=1)
-                    phase_i = phase_ids[:, i] - 1
+                    phase_i = phase_ids[:, i]
                     _, mc = model_forward_one_phase(
                         model, x_i, fixed_t, s0_i, s1_i, s2_i, s3_i,
                         phase_id=phase_i
@@ -554,7 +570,7 @@ def train():
                         s1_i = torch.cat([s1_moving[:, i], s1_fixed], dim=1)
                         s2_i = torch.cat([s2_moving[:, i], s2_fixed], dim=1)
                         s3_i = torch.cat([s3_moving[:, i], s3_fixed], dim=1)
-                        phase_i = phase_ids[:, i] - 1
+                        phase_i = phase_ids[:, i]
                         Di, _ = model_forward_one_phase(
                             model, x_i, fixed_t, s0_i, s1_i, s2_i, s3_i,
                             phase_id=phase_i
