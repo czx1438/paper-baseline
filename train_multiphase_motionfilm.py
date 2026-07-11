@@ -83,7 +83,8 @@ parser.add_argument("--loss_type", choices=["ncc", "mse"], default="ncc")
 parser.add_argument("--fg_thr", type=float, default=0.05)
 parser.add_argument("--t_enc", type=int, default=1)
 parser.add_argument("--checkpoint", type=int, default=2500)
-parser.add_argument("--log_interval", type=int, default=50)
+parser.add_argument("--log_interval", type=int, default=5)
+parser.add_argument("--vis_interval", type=int, default=1000)
 parser.add_argument("--no_ldm", action="store_true")
 parser.add_argument("--num_workers", type=int, default=0)
 parser.add_argument("--seed", type=int, default=SEED)
@@ -438,6 +439,202 @@ def append_eval_csv(path, step, result):
         )
 
 
+def visualize_training_sample(
+    step,
+    opt,
+    model,
+    ldm_model,
+    transform,
+    vis_samples,
+    vis_dir,
+):
+    """Render an 8-row x 3-col figure for three fixed vis samples.
+
+    vis_samples is the dict returned by `build_visualization_samples`, with keys
+    'fixed' [1, 1, H, W] and 'moving' [1, 3, 1, H, W] where the 3 channels are
+    phases 1, 5, 9 of the same slice.
+    """
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.colors import TwoSlopeNorm
+
+    model.eval()
+    was_training = model.training
+    cpu_rng = torch.get_rng_state()
+    cuda_rng = torch.cuda.get_rng_state()
+    torch.manual_seed(2026)
+    torch.cuda.manual_seed(2026)
+
+    fixed = vis_samples["fixed"].cuda().float()
+    moving = vis_samples["moving"].cuda().float()  # [1, 3, 1, H, W]
+    phase_ids = vis_samples["phase_ids"].cuda().long()
+    slice_label = vis_samples["label"]
+    phases = moving.shape[1]
+    height, width = moving.shape[-2:]
+
+    score_cache = [
+        extract_pair_scores(ldm_model, moving[:, p], fixed, opt.t_enc)
+        for p in range(phases)
+    ]
+
+    warped_list = []
+    dvf_list = []
+    jac_list = []
+    ncc_after = []
+    ncc_before = []
+    neg_jac = []
+
+    with torch.no_grad():
+        for p in range(phases):
+            model_phase = phase_ids[:, p] if opt.cond_mode == "motionfilm" else None
+            D, _ = model_forward(model, moving[:, p], fixed, score_cache[p], model_phase)
+            _, warped = transform(moving[:, p], D.permute(0, 2, 3, 1))
+
+            dvf = D[0].detach().cpu().numpy().copy()
+            dvf[0] *= height / 2.0
+            dvf[1] *= width / 2.0
+            jac = jacobian_determinant_vxm(dvf)
+
+            warped_list.append(warped[0, 0].detach().cpu().numpy())
+            dvf_list.append((dvf[0], dvf[1]))
+            jac_list.append(jac)
+            ncc_after.append(
+                1.0
+                - ncc_loss(
+                    fixed, warped, mask=body_mask(fixed, opt.fg_thr)
+                ).item()
+            )
+            ncc_before.append(
+                1.0
+                - ncc_loss(
+                    fixed, moving[:, p], mask=body_mask(fixed, opt.fg_thr)
+                ).item()
+            )
+            neg_jac.append(float((jac < 0).mean()))
+
+    torch.set_rng_state(cpu_rng)
+    torch.cuda.set_rng_state(cuda_rng)
+    if was_training:
+        model.train()
+
+    fig, axes = plt.subplots(
+        nrows=8, ncols=phases, figsize=(3.0 * phases, 18.0),
+        gridspec_kw={"hspace": 0.35, "wspace": 0.05},
+    )
+    row_titles = [
+        "Moving",
+        "Fixed",
+        "Warped",
+        "Diff |Fixed-Moving|",
+        "Diff |Fixed-Warped|",
+        "DVF-X (pixel)",
+        "DVF-Y (pixel)",
+        "Jacobian det (>=0 valid)",
+    ]
+    vmin_img, vmax_img = 0.0, 1.0
+    for p in range(phases):
+        axes[0, p].imshow(moving[0, p, 0].cpu().numpy(), cmap="gray", vmin=vmin_img, vmax=vmax_img)
+        axes[0, p].set_title(f"phase {int(phase_ids[0, p].item()) + 1}", fontsize=9)
+        axes[1, p].imshow(fixed[0, 0].cpu().numpy(), cmap="gray", vmin=vmin_img, vmax=vmax_img)
+        axes[2, p].imshow(warped_list[p], cmap="gray", vmin=vmin_img, vmax=vmax_img)
+        axes[3, p].imshow(
+            np.abs(fixed[0, 0].cpu().numpy() - moving[0, p, 0].cpu().numpy()),
+            cmap="magma",
+        )
+        axes[4, p].imshow(
+            np.abs(fixed[0, 0].cpu().numpy() - warped_list[p]),
+            cmap="magma",
+        )
+        dvf_max = max(
+            np.abs(dvf_list[p][0]).max(), np.abs(dvf_list[p][1]).max(), 1e-6
+        )
+        axes[5, p].imshow(dvf_list[p][0], cmap="seismic", vmin=-dvf_max, vmax=dvf_max)
+        axes[6, p].imshow(dvf_list[p][1], cmap="seismic", vmin=-dvf_max, vmax=dvf_max)
+        jac_abs = max(np.abs(jac_list[p].min()), np.abs(jac_list[p].max()), 1e-3)
+        axes[7, p].imshow(
+            jac_list[p],
+            cmap="RdBu_r",
+            vmin=-jac_abs,
+            vmax=jac_abs,
+        )
+        for row in range(8):
+            axes[row, p].set_xticks([])
+            axes[row, p].set_yticks([])
+
+    for row, title in enumerate(row_titles):
+        axes[row, 0].set_ylabel(title, fontsize=9)
+    fig.suptitle(
+        f"{opt.cond_mode} | step {step} | {slice_label} | "
+        f"NCC before/after: "
+        + " / ".join(
+            f"p{int(phase_ids[0, p].item()) + 1}:{ncc_before[p]:.3f}->{ncc_after[p]:.3f}"
+            for p in range(phases)
+        )
+        + f" | negR: "
+        + " / ".join(f"{neg_jac[p] * 100:.2f}%" for p in range(phases)),
+        fontsize=10,
+    )
+
+    out_path = os.path.join(vis_dir, f"step_{step:06d}.png")
+    fig.savefig(out_path, dpi=120, bbox_inches="tight")
+    plt.close(fig)
+    return out_path
+
+
+def build_visualization_samples(opt):
+    """Load one fixed (block 2 / slice 0 / phase 0) and its phase 1, 5, 9 movings.
+
+    Both modes use the same triplet so visual comparisons are apples-to-apples.
+    """
+    vis_split = PairwisePhaseDataset(
+        data_root=opt.data_root, split="val", flip_p=0.0, normalize=True
+    )
+    base_samples = vis_split.base_samples
+    target_block = 2
+    target_slice = 0
+    base_idx = None
+    for index, (block_id, slice_id) in enumerate(base_samples):
+        if block_id == target_block and slice_id == target_slice:
+            base_idx = index
+            break
+    if base_idx is None:
+        raise RuntimeError(
+            f"Could not find block {target_block} slice {target_slice} in val split"
+        )
+
+    base_samples[base_idx]
+    block_id, slice_id = base_samples[base_idx]
+    fixed_np = vis_split._load_npy(
+        vis_split._raw_index(block_id, 0, slice_id), vis_split.fixed_dir
+    )
+    fixed_np_min = fixed_np.min()
+    fixed_np_max = fixed_np.max()
+    if fixed_np_max - fixed_np_min > 1e-6:
+        fixed_np = (fixed_np - fixed_np_min) / (fixed_np_max - fixed_np_min)
+    fixed_t = torch.from_numpy(fixed_np).float().unsqueeze(0).unsqueeze(0)
+
+    phase_indices = [0, 4, 8]  # phase 1, 5, 9
+    moving_seq = []
+    for phase_index in phase_indices:
+        moving_np = vis_split._load_npy(
+            vis_split._raw_index(block_id, phase_index, slice_id), vis_split.moving_dir
+        )
+        if fixed_np_max - fixed_np_min > 1e-6:
+            moving_np = (moving_np - fixed_np_min) / (fixed_np_max - fixed_np_min)
+        moving_seq.append(moving_np)
+    moving_t = torch.from_numpy(np.stack(moving_seq, axis=0)).float()[:, None]
+    moving_t = moving_t.unsqueeze(0)  # [1, 3, 1, H, W]
+
+    return {
+        "fixed": fixed_t,
+        "moving": moving_t,
+        "phase_ids": torch.tensor(phase_indices, dtype=torch.long).unsqueeze(0),
+        "label": f"block{block_id}_slice{slice_id:02d}",
+    }
+
+
 def next_cycling(iterator, loader):
     try:
         return next(iterator), iterator
@@ -453,7 +650,6 @@ def train_baseline_step(
     metric_lists = {key: [] for key in ["image", "latent", "smooth", "bend", "jac"]}
     total_values = []
 
-    # Nine independent micro-batches = the same pair count as one 9-phase update.
     for _ in range(NUM_PHASES):
         batch, iterator = next_cycling(iterator, loader)
         fixed, moving, _, _ = unpack_pairwise(batch)
@@ -465,15 +661,8 @@ def train_baseline_step(
         with torch.no_grad():
             fixed_latent = encode_image(ldm_model, fixed)
         loss, metrics = registration_losses(
-            opt,
-            ldm_model,
-            transform,
-            latent_mse,
-            moving,
-            fixed,
-            foreground,
-            displacement,
-            fixed_latent,
+            opt, ldm_model, transform, latent_mse,
+            moving, fixed, foreground, displacement, fixed_latent,
         )
         (loss / NUM_PHASES).backward()
         total_values.append(loss.detach())
@@ -481,7 +670,7 @@ def train_baseline_step(
             metric_lists[key].append(metrics[key])
 
     optimizer.step()
-    summary = {key: torch.stack(values).mean().item() for key, values in metric_lists.items()}
+    summary = {key: torch.stack(v).mean().item() for key, v in metric_lists.items()}
     summary["total"] = torch.stack(total_values).mean().item()
     summary["z_acc"] = 0.0
     summary["dvf_acc"] = 0.0
@@ -503,113 +692,63 @@ def train_motionfilm_step(
 
     foreground = body_mask(fixed, opt.fg_thr)
     score_cache = [
-        extract_pair_scores(
-            ldm_model,
-            moving_sequence[:, phase],
-            fixed,
-            opt.t_enc,
-        )
-        for phase in range(phases)
+        extract_pair_scores(ldm_model, moving_sequence[:, p], fixed, opt.t_enc)
+        for p in range(phases)
     ]
     optimizer.zero_grad(set_to_none=True)
 
     motion_codes = []
-    low_resolution_dvfs = []
-    for phase in range(phases):
-        displacement, motion_code = model_forward(
-            model,
-            moving_sequence[:, phase],
-            fixed,
-            score_cache[phase],
-            phase_ids[:, phase],
+    dvf_low_list = []
+    for p in range(phases):
+        D, mc = model_forward(
+            model, moving_sequence[:, p], fixed, score_cache[p], phase_ids[:, p],
         )
-        if motion_code is None:
+        if mc is None:
             raise RuntimeError("MotionFiLM mode did not return a motion code")
-        motion_codes.append(motion_code)
-        low_resolution_dvfs.append(
-            F.interpolate(
-                displacement,
-                size=(64, 64),
-                mode="bilinear",
-                align_corners=True,
-            )
-        )
+        motion_codes.append(mc)
+        dvf_low_list.append(F.interpolate(D, size=(64, 64), mode="bilinear", align_corners=True))
 
-    motion_sequence = torch.stack(motion_codes, dim=1)
-    dvf_sequence = torch.stack(low_resolution_dvfs, dim=1)
-    motion_acceleration = (
-        motion_sequence[:, 2:]
-        - 2.0 * motion_sequence[:, 1:-1]
-        + motion_sequence[:, :-2]
-    )
+    mc_seq  = torch.stack(motion_codes, dim=1)
+    dvf_seq = torch.stack(dvf_low_list, dim=1)
+    mc_acc  = mc_seq[:, 2:] - 2.0 * mc_seq[:, 1:-1] + mc_seq[:, :-2]
+    dvf_acc = dvf_seq[:, 2:] - 2.0 * dvf_seq[:, 1:-1] + dvf_seq[:, :-2]
+
     with torch.no_grad():
         gaps = torch.stack(
-            [
-                1.0
-                - ncc_global(
-                    moving_sequence[:, phase],
-                    moving_sequence[:, phase + 1],
-                    foreground,
-                )
-                for phase in range(phases - 1)
-            ],
-            dim=1,
-        )
-        gap_acceleration = 0.5 * (gaps[:, :-1] + gaps[:, 1:])
-        weights = torch.exp(-opt.alpha_motion_gap * gap_acceleration)
-    z_acc_loss = (
-        weights * motion_acceleration.square().sum(dim=-1)
-    ).mean()
-    dvf_acceleration = (
-        dvf_sequence[:, 2:]
-        - 2.0 * dvf_sequence[:, 1:-1]
-        + dvf_sequence[:, :-2]
-    )
-    dvf_acc_loss = dvf_acceleration.abs().mean()
-    trajectory_loss = (
-        opt.lambda_z_acc * z_acc_loss
-        + opt.lambda_dvf_acc * dvf_acc_loss
-    )
-    if trajectory_loss.requires_grad:
-        trajectory_loss.backward()
+            [1.0 - ncc_global(moving_sequence[:, p], moving_sequence[:, p + 1], foreground)
+             for p in range(phases - 1)], dim=1)
+        gap_acc = 0.5 * (gaps[:, :-1] + gaps[:, 1:])
+        w = torch.exp(-opt.alpha_motion_gap * gap_acc)
 
-    del motion_sequence, dvf_sequence, motion_acceleration, dvf_acceleration
+    L_z_acc   = (w * mc_acc.square().sum(dim=-1)).mean()
+    L_dvf_acc = dvf_acc.abs().mean()
+    L_traj = opt.lambda_z_acc * L_z_acc + opt.lambda_dvf_acc * L_dvf_acc
+    if L_traj.requires_grad:
+        L_traj.backward()
+
+    del mc_seq, dvf_seq, mc_acc, dvf_acc
+
     with torch.no_grad():
         fixed_latent = encode_image(ldm_model, fixed)
 
-    metric_lists = {key: [] for key in ["image", "latent", "smooth", "bend", "jac"]}
-    registration_totals = []
-    for phase in range(phases):
-        moving = moving_sequence[:, phase]
-        displacement, _ = model_forward(
-            model,
-            moving,
-            fixed,
-            score_cache[phase],
-            phase_ids[:, phase],
-        )
+    metric_lists = {k: [] for k in ["image", "latent", "smooth", "bend", "jac"]}
+    reg_losses = []
+    for p in range(phases):
+        D, _ = model_forward(model, moving_sequence[:, p], fixed, score_cache[p], phase_ids[:, p])
         loss, metrics = registration_losses(
-            opt,
-            ldm_model,
-            transform,
-            latent_mse,
-            moving,
-            fixed,
-            foreground,
-            displacement,
-            fixed_latent,
+            opt, ldm_model, transform, latent_mse,
+            moving_sequence[:, p], fixed, foreground, D, fixed_latent,
         )
         (loss / phases).backward()
-        registration_totals.append(loss.detach())
-        for key in metric_lists:
-            metric_lists[key].append(metrics[key])
+        reg_losses.append(loss.detach())
+        for k in metric_lists:
+            metric_lists[k].append(metrics[k])
 
     optimizer.step()
-    summary = {key: torch.stack(values).mean().item() for key, values in metric_lists.items()}
-    registration_mean = torch.stack(registration_totals).mean().item()
-    summary["z_acc"] = z_acc_loss.detach().item()
-    summary["dvf_acc"] = dvf_acc_loss.detach().item()
-    summary["total"] = registration_mean + trajectory_loss.detach().item()
+    summary = {k: torch.stack(v).mean().item() for k, v in metric_lists.items()}
+    summary["total"]  = torch.stack(reg_losses).mean().item() + L_traj.detach().item()
+    summary["z_acc"]  = L_z_acc.detach().item()
+    summary["dvf_acc"] = L_dvf_acc.detach().item()
     return summary
 
 
@@ -661,6 +800,15 @@ def train():
     best_path = os.path.join(opt.save_dir, "best_val.pth")
     best_val_ncc = -float("inf")
     train_iterator = iter(train_loader)
+
+    vis_samples = build_visualization_samples(opt)
+    vis_dir = os.path.join(opt.save_dir, "visualizations")
+    os.makedirs(vis_dir, exist_ok=True)
+    print(
+        f"[Vis] deterministic samples = {vis_samples['label']} | "
+        f"phase_ids = {vis_samples['phase_ids'][0].tolist()} | "
+        f"-> {vis_dir}"
+    )
 
     for step in range(1, opt.iteration + 1):
         model.train()
@@ -726,6 +874,16 @@ def train():
                 best_val_ncc = validation["ncc_after"]
                 torch.save(model.state_dict(), best_path)
                 print(f"[Best] val NCC={best_val_ncc:.6f} -> {best_path}")
+
+        if step == 1 or step % opt.vis_interval == 0:
+            try:
+                vis_path = visualize_training_sample(
+                    step, opt, model, ldm_model, transform,
+                    vis_samples, vis_dir,
+                )
+                print(f"[Vis] step {step} -> {vis_path}")
+            except Exception as exc:  # noqa: BLE001
+                print(f"[Vis] step {step} failed: {exc}")
 
     if not os.path.exists(best_path):
         torch.save(model.state_dict(), best_path)
