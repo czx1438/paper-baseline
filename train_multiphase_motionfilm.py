@@ -728,6 +728,16 @@ def train_motionfilm_step(
         dvf_low_list.append(F.interpolate(D, size=(64, 64), mode="bilinear", align_corners=True))
 
     mc_seq  = torch.stack(motion_codes, dim=1)
+    with torch.no_grad():
+        mc_jump = (
+            mc_seq[:, 1:] - mc_seq[:, :-1]
+        ).norm(dim=-1).mean()
+
+        mc_std = mc_seq.std(dim=1).mean()
+        mc_norm = mc_seq.norm(dim=-1).mean()
+        mc_ratio = mc_std / (mc_norm + 1e-8)
+    print(f"MotionFiLM motion code statistics: {mc_jump.item():.8f} {mc_std.item():.8f} {mc_norm.item():.8f} {mc_ratio.item():.8e}")
+    
     dvf_seq = torch.stack(dvf_low_list, dim=1)
     mc_acc  = mc_seq[:, 2:] - 2.0 * mc_seq[:, 1:-1] + mc_seq[:, :-2]
     dvf_acc = dvf_seq[:, 2:] - 2.0 * dvf_seq[:, 1:-1] + dvf_seq[:, :-2]
