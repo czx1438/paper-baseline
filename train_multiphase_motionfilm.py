@@ -101,6 +101,16 @@ parser.add_argument("--no_ldm", action="store_true",
                     help="使用 CNN-only 编码 (latent loss 仍计算但 LWCA 用 CNN 特征)")
 parser.add_argument("--log_interval", type=int, default=50)
 parser.add_argument("--vis_interval", type=int, default=1000)
+# ----- 多 cond 模式开关（控制是否启用 MotionFiLM + trajectory loss） -----
+parser.add_argument("--cond_mode", type=str,
+                    choices=["baseline", "motionfilm"],
+                    default="motionfilm",
+                    help="baseline  = LDMMorph(use_motion_film=False) + 不计算/不反向 "
+                         "L_z_acc/L_dvf_acc（等效旧版 NPZ 多相位的无 FiLM 基线）\n"
+                         "motionfilm = LDMMorph(use_motion_film=True) + L_z_acc/L_dvf_acc "
+                         "（默认）\n"
+                         "无论选哪个，模型、数据集、score 提取逻辑都一致，"
+                         "仅 LDMMorph(use_motion_film) 与 trajectory backward 走不通分支。")
 
 
 # ===================== utils =====================
@@ -263,7 +273,24 @@ def model_forward_one_phase(model, x_one, y, score0, score1, score2, score3, pha
 # ===================== train =====================
 def train():
     opt, unknown = parser.parse_known_args()
-    print('==[Multi-phase MotionFiLM v2: Trajectory Consistency]==')
+
+    # =========================================================
+    # [v2 baseline] 根据 cond_mode 注入 save_dir 后缀 + 覆写 trajectory 系数
+    #   - 默认 save_dir 用户没显式传时，按 cond_mode 拼后缀 → 并排对比
+    #   - baseline 模式强制把 lambda_z_acc / lambda_dvf_acc / alpha_motion_gap 压回 0
+    #     （即使命令行误传了非零值），避免 trajectory loss 被错误反向
+    # =========================================================
+    _DEFAULT_SAVE_DIR = '/root/autodl-tmp/LDM-Morph-main/LDM-Morph-main/logs/MotionFiLM_MultiPhase_v2'
+    if opt.save_dir == _DEFAULT_SAVE_DIR:
+        # 用户没显式改 save_dir → 按 cond_mode 拼后缀
+        opt.save_dir = f'{_DEFAULT_SAVE_DIR}_{opt.cond_mode}'
+    if opt.cond_mode == 'baseline':
+        opt.lambda_z_acc   = 0.0
+        opt.lambda_dvf_acc = 0.0
+        opt.alpha_motion_gap = 0.0
+
+    print(f'==[Multi-phase MotionFiLM v2: cond_mode = {opt.cond_mode}]==')
+    print(f'==[save_dir = {opt.save_dir}]==')
     for k, v in vars(opt).items():
         print(f'  {k} = {v}')
 
@@ -312,9 +339,11 @@ def train():
     print("=" * 72)
 
     # ----------- Model -----------
+    # [v2 baseline] use_motion_film 仅 motionfilm 模式开启；baseline 走无 FiLM 路径
+    use_motion_film = (opt.cond_mode == "motionfilm")
     model = LDMMorph(128*2, 192*2, 320*2, 448*2,
                      use_ldm=not opt.no_ldm,
-                     use_motion_film=True)
+                     use_motion_film=use_motion_film)
     model.cuda()
     total = sum(p.nelement() for p in model.parameters())
     print(f"Number of parameter: {total/1e6:.2f}M")
@@ -362,6 +391,14 @@ def train():
 
             fg = body_mask(fixed_t, thr=opt.fg_thr)
 
+            # =========================================================
+            # [v2 baseline] cond_mode 决定 phase_id 怎么传给 LDMMorph
+            #   - motionfilm : 传 [B] phase_ids[:, i]，走 motion_encoder + FiLM
+            #   - baseline   : 传 None，LDMMorph 内完全跳过 FiLM，等价无 FiLM 基线
+            # =========================================================
+            use_film = (opt.cond_mode == "motionfilm")
+            phase_id_for_model = phase_ids if use_film else None
+
             # --- LDM score 提取 (fixed + 9 moving) ---
             with torch.no_grad():
                 # fixed [B,1,H,W] + 9 moving [B,9,1,H,W] → [B, 10, 1, H, W]
@@ -384,83 +421,98 @@ def train():
 
             # =========================================================
             # 第 1 阶段: trajectory loss
-            #   只保留 motion_code + 低分 DVF (供 L_dvf_acc)
-            #   不保留 warped / latent MSE 计算图
+            #   只在 motionfilm 模式下执行 (use_film=True):
+            #     - 算 motion_code + 低分 DVF → L_z_acc + L_dvf_acc → loss_traj.backward()
+            #   baseline (use_film=False) 完全跳过该阶段，下面用 0 tensor 占位
+            #   保证下游日志/CSV 代码统一处理
             # =========================================================
-            motion_codes = []
-            disp_low_list = []
+            if use_film:
+                # 保留 motion_code + 低分 DVF (供 L_dvf_acc)
+                # 不保留 warped / latent MSE 计算图
+                motion_codes = []
+                disp_low_list = []
 
-            # =========================================================
-            # safety: phase_ids 范围必须是 0..8 (否则 phase_embedding 越界)
-            # 注: dataset 里 phase_ids 已经是 0..8 (内部索引), 不需要再 -1
-            # =========================================================
-            assert phase_ids.min() >= 0 and phase_ids.max() <= 8, \
-                f"phase_ids out of expected range 0..8, got min={phase_ids.min().item()} max={phase_ids.max().item()}"
+                # =========================================================
+                # safety: phase_ids 范围必须是 0..8 (否则 phase_embedding 越界)
+                # 注: dataset 里 phase_ids 已经是 0..8 (内部索引), 不需要再 -1
+                # =========================================================
+                assert phase_ids.min() >= 0 and phase_ids.max() <= 8, \
+                    f"phase_ids out of expected range 0..8, got min={phase_ids.min().item()} max={phase_ids.max().item()}"
 
-            for i in range(P):
-                x_i = moving_seq_t[:, i]
-                # 4-block concat (与 train_mask.py 一致)
-                score0_i = torch.cat([s0_moving[:, i], s0_fixed], dim=1)
-                score1_i = torch.cat([s1_moving[:, i], s1_fixed], dim=1)
-                score2_i = torch.cat([s2_moving[:, i], s2_fixed], dim=1)
-                score3_i = torch.cat([s3_moving[:, i], s3_fixed], dim=1)
-                # dataset 给的 phase_ids 已经是 0..8 (内部索引), 直接喂给 embedding
-                phase_i = phase_ids[:, i]
-                assert phase_i.min() >= 0 and phase_i.max() <= 8, \
-                    f"phase_i after -1 out of range 0..8, got min={phase_i.min().item()} max={phase_i.max().item()}"
-
-                D_f_xy, m_code = model_forward_one_phase(
-                    model, x_i, fixed_t,
-                    score0_i, score1_i, score2_i, score3_i,
-                    phase_id=phase_i
-                )
-                motion_codes.append(m_code)
-
-                # 低分 DVF 单独用于 L_dvf_acc (避免保留 full-res 计算图)
-                D_low = F.interpolate(
-                    D_f_xy, size=(64, 64), mode='bilinear', align_corners=True
-                )
-                disp_low_list.append(D_low)
-
-                # 立即释放 full-res 计算图引用
-                del D_f_xy
-                torch.cuda.empty_cache()
-
-            motion_code_seq = torch.stack(motion_codes, dim=1)            # [B, P, 16]
-            disp_low_stack  = torch.stack(disp_low_list, dim=1)            # [B, P, 2, 64, 64]
-
-            # 二阶 motion code 差分
-            z_acc = (motion_code_seq[:, 2:]
-                     - 2.0 * motion_code_seq[:, 1:-1]
-                     + motion_code_seq[:, :-2])                              # [B, P-2, 16]
-            z_acc_norm = (z_acc ** 2).sum(dim=-1)                            # [B, P-2]
-
-            with torch.no_grad():
-                gap = torch.zeros(B, P - 1, device=fixed_t.device)
-                for i in range(P - 1):
-                    gap[:, i] = 1.0 - ncc_global(
-                        moving_seq_t[:, i],
-                        moving_seq_t[:, i + 1],
-                        mask=fg
+                for i in range(P):
+                    x_i = moving_seq_t[:, i]
+                    # 4-block concat (与 train_mask.py 一致)
+                    score0_i = torch.cat([s0_moving[:, i], s0_fixed], dim=1)
+                    score1_i = torch.cat([s1_moving[:, i], s1_fixed], dim=1)
+                    score2_i = torch.cat([s2_moving[:, i], s2_fixed], dim=1)
+                    score3_i = torch.cat([s3_moving[:, i], s3_fixed], dim=1)
+                    # dataset 给的 phase_ids 已经是 0..8 (内部索引), 直接喂给 embedding
+                    phase_i = phase_ids[:, i]
+                    assert phase_i.min() >= 0 and phase_i.max() <= 8, \
+                        f"phase_i after -1 out of range 0..8, got min={phase_i.min().item()} max={phase_i.max().item()}"
+    
+                    D_f_xy, m_code = model_forward_one_phase(
+                        model, x_i, fixed_t,
+                        score0_i, score1_i, score2_i, score3_i,
+                        phase_id=phase_i
                     )
-                gap_acc = 0.5 * (gap[:, :-1] + gap[:, 1:])                   # [B, P-2]
-                w = torch.exp(-opt.alpha_motion_gap * gap_acc)
+                    motion_codes.append(m_code)
 
-            L_z_acc = (w * z_acc_norm).mean()
+                    # 低分 DVF 单独用于 L_dvf_acc (避免保留 full-res 计算图)
+                    D_low = F.interpolate(
+                        D_f_xy, size=(64, 64), mode='bilinear', align_corners=True
+                    )
+                    disp_low_list.append(D_low)
 
-            disp_acc = (disp_low_stack[:, 2:]
-                        - 2.0 * disp_low_stack[:, 1:-1]
-                        + disp_low_stack[:, :-2])                            # [B, P-2, 2, 64, 64]
-            L_dvf_acc = torch.abs(disp_acc).mean()
+                    # 立即释放 full-res 计算图引用
+                    del D_f_xy
+                    torch.cuda.empty_cache()
 
-            loss_traj = (opt.lambda_z_acc   * L_z_acc
-                       + opt.lambda_dvf_acc * L_dvf_acc)
-            loss_traj.backward()
+                motion_code_seq = torch.stack(motion_codes, dim=1)            # [B, P, 16]
+                disp_low_stack  = torch.stack(disp_low_list, dim=1)            # [B, P, 2, 64, 64]
 
-            # 释放第 1 阶段残留
-            last_motion_code_seq = motion_code_seq.detach().cpu().numpy()
-            last_z_acc_norm     = z_acc_norm.detach().cpu().numpy()
-            del z_acc, z_acc_norm, disp_acc, disp_low_stack, motion_code_seq
+                # 二阶 motion code 差分
+                z_acc = (motion_code_seq[:, 2:]
+                         - 2.0 * motion_code_seq[:, 1:-1]
+                         + motion_code_seq[:, :-2])                              # [B, P-2, 16]
+                z_acc_norm = (z_acc ** 2).sum(dim=-1)                            # [B, P-2]
+
+                with torch.no_grad():
+                    gap = torch.zeros(B, P - 1, device=fixed_t.device)
+                    for i in range(P - 1):
+                        gap[:, i] = 1.0 - ncc_global(
+                            moving_seq_t[:, i],
+                            moving_seq_t[:, i + 1],
+                            mask=fg
+                        )
+                    gap_acc = 0.5 * (gap[:, :-1] + gap[:, 1:])                   # [B, P-2]
+                    w = torch.exp(-opt.alpha_motion_gap * gap_acc)
+
+                L_z_acc = (w * z_acc_norm).mean()
+
+                disp_acc = (disp_low_stack[:, 2:]
+                            - 2.0 * disp_low_stack[:, 1:-1]
+                            + disp_low_stack[:, :-2])                            # [B, P-2, 2, 64, 64]
+                L_dvf_acc = torch.abs(disp_acc).mean()
+
+                loss_traj = (opt.lambda_z_acc   * L_z_acc
+                           + opt.lambda_dvf_acc * L_dvf_acc)
+                loss_traj.backward()
+                last_motion_code_seq = motion_code_seq.detach().cpu().numpy()
+                last_z_acc_norm     = z_acc_norm.detach().cpu().numpy()
+                del z_acc, z_acc_norm, disp_acc, disp_low_stack, motion_code_seq
+            else:
+                # [baseline] 无 FiLM, 无 motion_code, 无 trajectory loss
+                L_z_acc   = torch.tensor(0.0, device=fixed_t.device)
+                L_dvf_acc = torch.tensor(0.0, device=fixed_t.device)
+                loss_traj = torch.tensor(0.0, device=fixed_t.device)
+                # 占位 numpy 数组, shape 与 motionfilm 路径一致, 给下游日志/CSV 使用
+                last_motion_code_seq = np.zeros((B, P, 16), dtype=np.float32)
+                last_z_acc_norm      = np.zeros((B, P - 2), dtype=np.float32)
+                # 占位 gap / weight (仅 baseline 日志用)
+                gap_acc = torch.zeros(B, P - 2, device=fixed_t.device)
+                w       = torch.ones (B, P - 2, device=fixed_t.device)
+
             torch.cuda.empty_cache()
 
             # =========================================================
@@ -493,7 +545,7 @@ def train():
                 D_f_xy, _ = model_forward_one_phase(
                     model, x_i, fixed_t,
                     score0_i, score1_i, score2_i, score3_i,
-                    phase_id=phase_i
+                    phase_id=(phase_i if use_film else None)
                 )
                 _, warped_i = transform(x_i, D_f_xy.permute(0, 2, 3, 1))
 
@@ -535,27 +587,29 @@ def train():
 
             # --- 收集 motion_code (第 1 阶段已 stack 过的 motion_code_seq) ---
             # 重新 forward 一遍取 motion_code 仅做记录 (no_grad)
-            with torch.no_grad():
-                mc_list = []
-                for i in range(P):
-                    x_i = moving_seq_t[:, i]
-                    s0_i = torch.cat([s0_moving[:, i], s0_fixed], dim=1)
-                    s1_i = torch.cat([s1_moving[:, i], s1_fixed], dim=1)
-                    s2_i = torch.cat([s2_moving[:, i], s2_fixed], dim=1)
-                    s3_i = torch.cat([s3_moving[:, i], s3_fixed], dim=1)
-                    phase_i = phase_ids[:, i]
-                    _, mc = model_forward_one_phase(
-                        model, x_i, fixed_t, s0_i, s1_i, s2_i, s3_i,
-                        phase_id=phase_i
-                    )
-                    mc_list.append(mc)
-                motion_code_seq = torch.stack(mc_list, dim=1)
-            mc_np = motion_code_seq.detach().cpu().numpy()
-            for b in range(B):
-                if len(motion_codes_buf) >= motion_code_buf_max:
-                    break
-                motion_codes_buf.append(mc_np[b])
-                motion_code_pairs.append(f"{pairnames[b]}")
+            # [v2 baseline] baseline 模式没有 motion_code, 跳过收集
+            if use_film:
+                with torch.no_grad():
+                    mc_list = []
+                    for i in range(P):
+                        x_i = moving_seq_t[:, i]
+                        s0_i = torch.cat([s0_moving[:, i], s0_fixed], dim=1)
+                        s1_i = torch.cat([s1_moving[:, i], s1_fixed], dim=1)
+                        s2_i = torch.cat([s2_moving[:, i], s2_fixed], dim=1)
+                        s3_i = torch.cat([s3_moving[:, i], s3_fixed], dim=1)
+                        phase_i = phase_ids[:, i]
+                        _, mc = model_forward_one_phase(
+                            model, x_i, fixed_t, s0_i, s1_i, s2_i, s3_i,
+                            phase_id=phase_i
+                        )
+                        mc_list.append(mc)
+                    motion_code_seq = torch.stack(mc_list, dim=1)
+                mc_np = motion_code_seq.detach().cpu().numpy()
+                for b in range(B):
+                    if len(motion_codes_buf) >= motion_code_buf_max:
+                        break
+                    motion_codes_buf.append(mc_np[b])
+                    motion_code_pairs.append(f"{pairnames[b]}")
 
             # =============================================================
             # 日志
@@ -573,7 +627,7 @@ def train():
                         phase_i = phase_ids[:, i]
                         Di, _ = model_forward_one_phase(
                             model, x_i, fixed_t, s0_i, s1_i, s2_i, s3_i,
-                            phase_id=phase_i
+                            phase_id=(phase_i if use_film else None)
                         )
                         _, wi = transform(x_i, Di.permute(0, 2, 3, 1))
                         ncc_p.append(
@@ -585,11 +639,11 @@ def train():
 
                     gap_mean_val    = gap_acc.mean().item()
                     weight_mean_val = w.mean().item()
-                    mc_t = torch.as_tensor(last_motion_code_seq, device=motion_code_seq.device)
+                    mc_t = torch.as_tensor(last_motion_code_seq, device=fixed_t.device)
                     mc_std      = mc_t.std().item()
                     mc_norm_m   = mc_t.norm(dim=-1).mean().item()
                     z_jump = (mc_t[:, 1:] - mc_t[:, :-1]).norm(dim=-1).mean()
-                    za_t = torch.as_tensor(last_z_acc_norm, device=motion_code_seq.device)
+                    za_t = torch.as_tensor(last_z_acc_norm, device=fixed_t.device)
                     z_acc_raw = za_t.sqrt().mean()
 
                     print(
@@ -597,27 +651,49 @@ def train():
                         f"z_acc_raw={z_acc_raw.item():.6f} "
                         f"mc_std={mc_std:.4f} mc_norm={mc_norm_m:.4f}"
                     )
-                    sys.stdout.write(
-                        f"\rstep {step} "
-                        f"L={loss.item():.4f} "
-                        f"L_reg={loss_reg.item():.4f} "
-                        f"L_NCC={loss_image.item():.4f} "
-                        f"L_zMSE={loss_mse_lat.item():.4f} "
-                        f"L_smth={loss_smth.item():.4f} "
-                        f"L_z_acc={L_z_acc.item():.8f} "
-                        f"L_dvf_acc={L_dvf_acc.item():.8f} "
-                        f"gap={gap_mean_val:.3f} "
-                        f"w={weight_mean_val:.3f} "
-                        f"z_jump={z_jump.item():.4f} "
-                        f"z_acc_raw={z_acc_raw.item():.4f} "
-                        f"mc_std={mc_std:.4f} "
-                        f"mc_norm={mc_norm_m:.4f} "
-                        f"NCC_p1/5/9={ncc_p1:.3f}/{ncc_p5:.3f}/{ncc_p9:.3f} "
-                        f"negR_p1/5/9={neg_p1*100:.2f}/{neg_p5*100:.2f}/{neg_p9*100:.2f}%")
+                    if use_film:
+                        sys.stdout.write(
+                            f"\rstep {step} "
+                            f"L={loss.item():.4f} "
+                            f"L_reg={loss_reg.item():.4f} "
+                            f"L_NCC={loss_image.item():.4f} "
+                            f"L_zMSE={loss_mse_lat.item():.4f} "
+                            f"L_smth={loss_smth.item():.4f} "
+                            f"L_z_acc={L_z_acc.item():.8f} "
+                            f"L_dvf_acc={L_dvf_acc.item():.8f} "
+                            f"gap={gap_mean_val:.3f} "
+                            f"w={weight_mean_val:.3f} "
+                            f"z_jump={z_jump.item():.4f} "
+                            f"z_acc_raw={z_acc_raw.item():.4f} "
+                            f"mc_std={mc_std:.4f} "
+                            f"mc_norm={mc_norm_m:.4f} "
+                            f"NCC_p1/5/9={ncc_p1:.3f}/{ncc_p5:.3f}/{ncc_p9:.3f} "
+                            f"negR_p1/5/9={neg_p1*100:.2f}/{neg_p5*100:.2f}/{neg_p9*100:.2f}%")
+                    else:
+                        # baseline: 无 trajectory 列, 打印短一点
+                        sys.stdout.write(
+                            f"\rstep {step} "
+                            f"L={loss.item():.4f} "
+                            f"L_reg={loss_reg.item():.4f} "
+                            f"L_NCC={loss_image.item():.4f} "
+                            f"L_zMSE={loss_mse_lat.item():.4f} "
+                            f"L_smth={loss_smth.item():.4f} "
+                            f"NCC_p1/5/9={ncc_p1:.3f}/{ncc_p5:.3f}/{ncc_p9:.3f} "
+                            f"negR_p1/5/9={neg_p1*100:.2f}/{neg_p5*100:.2f}/{neg_p9*100:.2f}%")
                     sys.stdout.flush()
 
                     if step % opt.vis_interval == 0:
                         with open(csv_name, 'a') as f:
+                            # [v2 baseline] baseline 模式下 trajectory 列固定写 0,
+                            # 列顺序与表头完全一致 (motionfilm 路径下行为不变)
+                            _z_acc_v   = L_z_acc.item()   if use_film else 0.0
+                            _dvf_acc_v = L_dvf_acc.item() if use_film else 0.0
+                            _gap_v     = gap_mean_val     if use_film else 0.0
+                            _w_v       = weight_mean_val  if use_film else 1.0
+                            _zj_v      = z_jump.item()    if use_film else 0.0
+                            _zaraw_v   = z_acc_raw.item() if use_film else 0.0
+                            _mcstd_v   = mc_std           if use_film else 0.0
+                            _mcnorm_v  = mc_norm_m        if use_film else 0.0
                             csv.writer(f).writerow([
                                 step,
                                 f"{loss.item():.6f}",
@@ -627,17 +703,17 @@ def train():
                                 f"{loss_smth.item():.6f}",
                                 f"{0.0:.6f}",   # L_bend (deprecated, 默认 0)
                                 f"{0.0:.6f}",   # L_jac  (deprecated, 默认 0)
-                                f"{L_z_acc.item():.6f}",
-                                f"{L_dvf_acc.item():.6f}",
-                                f"{gap_mean_val:.6f}",
-                                f"{weight_mean_val:.6f}",
+                                f"{_z_acc_v:.6f}",
+                                f"{_dvf_acc_v:.6f}",
+                                f"{_gap_v:.6f}",
+                                f"{_w_v:.6f}",
                                 f"{0.0:.6f}",   # L_periodic (deprecated)
                                 f"{ncc_p1:.6f}", f"{ncc_p5:.6f}", f"{ncc_p9:.6f}",
                                 f"{neg_p1:.6f}", f"{neg_p5:.6f}", f"{neg_p9:.6f}",
-                                f"{z_jump.item():.6f}",
-                                f"{z_acc_raw.item():.6f}",
-                                f"{mc_std:.6f}",
-                                f"{mc_norm_m:.6f}",
+                                f"{_zj_v:.6f}",
+                                f"{_zaraw_v:.6f}",
+                                f"{_mcstd_v:.6f}",
+                                f"{_mcnorm_v:.6f}",
                             ])
 
             # --- checkpoint ---
@@ -646,7 +722,8 @@ def train():
                 torch.save(model.state_dict(), ck_path)
                 print(f"\n[ckpt] saved {ck_path}")
 
-                if len(motion_codes_buf) > 0:
+                # [v2 baseline] baseline 模式不收集 motion_code, 跳过 npz 落盘
+                if use_film and len(motion_codes_buf) > 0:
                     np.savez_compressed(
                         motion_code_path,
                         motion_codes=np.stack(motion_codes_buf, axis=0),
@@ -659,7 +736,8 @@ def train():
                 break
 
     # --- 训练结束 ---
-    if len(motion_codes_buf) > 0:
+    # [v2 baseline] baseline 模式没有 motion_code, 不写 motion_codes.npz
+    if use_film and len(motion_codes_buf) > 0:
         np.savez_compressed(
             motion_code_path,
             motion_codes=np.stack(motion_codes_buf, axis=0),
