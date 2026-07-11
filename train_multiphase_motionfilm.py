@@ -69,6 +69,11 @@ parser.add_argument(
     default="/root/autodl-tmp/LDM-Morph-main/LDM-Morph-main/xcat_data",
 )
 parser.add_argument("--cond_mode", choices=["baseline", "motionfilm"], default="motionfilm")
+parser.add_argument(
+    "--no_phase_id",
+    action="store_true",
+    help="Disable phase embedding; MotionFiLM only uses MotionEncoder(moving, fixed).",
+)
 parser.add_argument("--lr", type=float, default=1e-4)
 parser.add_argument("--bs", type=int, default=1)
 parser.add_argument("--iteration", type=int, default=24001)
@@ -361,7 +366,11 @@ def evaluate(opt, model, ldm_model, transform, loader, split_name):
         phase_id = phase_id.cuda().long()
         foreground = body_mask(fixed, opt.fg_thr)
         scores = extract_pair_scores(ldm_model, moving, fixed, opt.t_enc)
-        model_phase = phase_id if opt.cond_mode == "motionfilm" else None
+        model_phase = (
+            phase_id
+            if opt.cond_mode == "motionfilm" and not opt.no_phase_id
+            else None
+        )
         displacement, _ = model_forward(model, moving, fixed, scores, model_phase)
         _, warped = transform(moving, displacement.permute(0, 2, 3, 1))
 
@@ -488,7 +497,11 @@ def visualize_training_sample(
 
     with torch.no_grad():
         for p in range(phases):
-            model_phase = phase_ids[:, p] if opt.cond_mode == "motionfilm" else None
+            model_phase = (
+            phase_ids[:, p]
+            if opt.cond_mode == "motionfilm" and not opt.no_phase_id
+            else None
+        )
             D, _ = model_forward(model, moving[:, p], fixed, score_cache[p], model_phase)
             _, warped = transform(moving[:, p], D.permute(0, 2, 3, 1))
 
@@ -700,8 +713,14 @@ def train_motionfilm_step(
     motion_codes = []
     dvf_low_list = []
     for p in range(phases):
+        model_phase = None if opt.no_phase_id else phase_ids[:, p]
+
         D, mc = model_forward(
-            model, moving_sequence[:, p], fixed, score_cache[p], phase_ids[:, p],
+            model,
+            moving_sequence[:, p],
+            fixed,
+            score_cache[p],
+            model_phase,
         )
         if mc is None:
             raise RuntimeError("MotionFiLM mode did not return a motion code")
@@ -734,7 +753,15 @@ def train_motionfilm_step(
     metric_lists = {k: [] for k in ["image", "latent", "smooth", "bend", "jac"]}
     reg_losses = []
     for p in range(phases):
-        D, _ = model_forward(model, moving_sequence[:, p], fixed, score_cache[p], phase_ids[:, p])
+        model_phase = None if opt.no_phase_id else phase_ids[:, p]
+
+        D, _ = model_forward(
+            model,
+            moving_sequence[:, p],
+            fixed,
+            score_cache[p],
+            model_phase,
+        )
         loss, metrics = registration_losses(
             opt, ldm_model, transform, latent_mse,
             moving_sequence[:, p], fixed, foreground, D, fixed_latent,
@@ -758,6 +785,10 @@ def train():
     opt.save_dir = os.path.join(opt.save_dir, opt.cond_mode)
     os.makedirs(opt.save_dir, exist_ok=True)
     print(f"[Mode] {opt.cond_mode} | save_dir={opt.save_dir}")
+    print(
+    f"[Conditioning] use_motion_film={opt.cond_mode == 'motionfilm'} | "
+    f"use_phase_embedding={opt.cond_mode == 'motionfilm' and not opt.no_phase_id}"
+)
 
     train_loader, val_loader, test_loader = make_loaders(opt)
     if opt.cond_mode == "baseline":
