@@ -1,11 +1,16 @@
-"""Fair pairwise-baseline vs multi-phase MotionFiLM training.
+"""Fair pairwise-baseline vs pairwise/multi-phase MotionFiLM training.
 
-Both modes use the same block split and preprocessing.
+All modes use the same block split and preprocessing.
 
 baseline:
     Independent pairwise samples. Nine micro-batches are accumulated before
     each optimizer update, so every update sees the same number of pairs as
     MotionFiLM.
+
+pairwise_motionfilm:
+    The same independent pairwise samples and nine-micro-batch accumulation as
+    baseline, with image-conditioned MotionEncoder + FiLM enabled. No phase ID
+    or multi-phase trajectory loss is used.
 
 motionfilm:
     One sample contains one phase-0 fixed image and phase-1..9 moving images.
@@ -68,7 +73,11 @@ parser.add_argument(
     "--data_root",
     default="/root/autodl-tmp/LDM-Morph-main/LDM-Morph-main/xcat_data",
 )
-parser.add_argument("--cond_mode", choices=["baseline", "motionfilm"], default="motionfilm")
+parser.add_argument(
+    "--cond_mode",
+    choices=["baseline", "pairwise_motionfilm", "motionfilm"],
+    default="motionfilm",
+)
 parser.add_argument(
     "--no_phase_id",
     action="store_true",
@@ -312,7 +321,7 @@ def unpack_pairwise(batch):
 
 def make_loaders(opt):
     common = dict(data_root=opt.data_root, normalize=True)
-    if opt.cond_mode == "baseline":
+    if opt.cond_mode in ("baseline", "pairwise_motionfilm"):
         train_set = PairwisePhaseDataset(split="train", flip_p=0.5, **common)
         train_collate = collate_pairwise
     else:
@@ -656,7 +665,7 @@ def next_cycling(iterator, loader):
         return next(iterator), iterator
 
 
-def train_baseline_step(
+def train_pairwise_step(
     opt, model, ldm_model, transform, latent_mse, optimizer, iterator, loader
 ):
     optimizer.zero_grad(set_to_none=True)
@@ -796,12 +805,12 @@ def train():
     os.makedirs(opt.save_dir, exist_ok=True)
     print(f"[Mode] {opt.cond_mode} | save_dir={opt.save_dir}")
     print(
-    f"[Conditioning] use_motion_film={opt.cond_mode == 'motionfilm'} | "
-    f"use_phase_embedding={opt.cond_mode == 'motionfilm' and not opt.no_phase_id}"
-)
+        f"[Conditioning] use_motion_film={opt.cond_mode in ('pairwise_motionfilm', 'motionfilm')} | "
+        f"use_phase_embedding={opt.cond_mode == 'motionfilm' and not opt.no_phase_id}"
+    )
 
     train_loader, val_loader, test_loader = make_loaders(opt)
-    if opt.cond_mode == "baseline":
+    if opt.cond_mode in ("baseline", "pairwise_motionfilm"):
         train_pairs = len(train_loader.dataset)
         print(f"[Data] train={train_pairs} independent pairs")
     else:
@@ -820,7 +829,7 @@ def train():
         320 * 2,
         448 * 2,
         use_ldm=not opt.no_ldm,
-        use_motion_film=opt.cond_mode == "motionfilm",
+        use_motion_film=opt.cond_mode in ("pairwise_motionfilm", "motionfilm"),
     ).cuda()
     transform = SpatialTransform().cuda()
     for parameter in transform.parameters():
@@ -853,8 +862,8 @@ def train():
 
     for step in range(1, opt.iteration + 1):
         model.train()
-        if opt.cond_mode == "baseline":
-            metrics, train_iterator = train_baseline_step(
+        if opt.cond_mode in ("baseline", "pairwise_motionfilm"):
+            metrics, train_iterator = train_pairwise_step(
                 opt,
                 model,
                 ldm_model,
@@ -943,4 +952,3 @@ def train():
 
 if __name__ == "__main__":
     train()
-
