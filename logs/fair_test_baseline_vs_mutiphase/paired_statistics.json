@@ -1,0 +1,9 @@
+{
+  "unit": "slice_mean_over_9_phases",
+  "n_slices": 19,
+  "motion_minus_baseline_ncc_mean": -0.0090575549337599,
+  "motion_minus_baseline_ncc_std": 0.002478041949866812,
+  "motion_minus_baseline_neg_ratio_mean": -0.0009414717467904787,
+  "wilcoxon_ncc_p": 3.814697265625e-06,
+  "wilcoxon_neg_ratio_p": 9.5367431640625e-05
+}
