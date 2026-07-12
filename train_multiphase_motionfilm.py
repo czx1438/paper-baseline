@@ -12,6 +12,11 @@ pairwise_motionfilm:
     baseline, with image-conditioned MotionEncoder + FiLM enabled. No phase ID
     or multi-phase trajectory loss is used.
 
+multiphase_motionfilm_no_traj:
+    The same phase-0 fixed plus phase-1..9 moving sample organization as the
+    full multi-phase mode, with MotionFiLM enabled but both trajectory losses
+    excluded from optimization.
+
 motionfilm:
     One sample contains one phase-0 fixed image and phase-1..9 moving images.
     Registration losses are averaged over phases and coupled by motion-code
@@ -75,7 +80,12 @@ parser.add_argument(
 )
 parser.add_argument(
     "--cond_mode",
-    choices=["baseline", "pairwise_motionfilm", "motionfilm"],
+    choices=[
+        "baseline",
+        "pairwise_motionfilm",
+        "multiphase_motionfilm_no_traj",
+        "motionfilm",
+    ],
     default="motionfilm",
 )
 parser.add_argument(
@@ -377,7 +387,8 @@ def evaluate(opt, model, ldm_model, transform, loader, split_name):
         scores = extract_pair_scores(ldm_model, moving, fixed, opt.t_enc)
         model_phase = (
             phase_id
-            if opt.cond_mode == "motionfilm" and not opt.no_phase_id
+            if opt.cond_mode in ("multiphase_motionfilm_no_traj", "motionfilm")
+            and not opt.no_phase_id
             else None
         )
         displacement, _ = model_forward(model, moving, fixed, scores, model_phase)
@@ -508,7 +519,8 @@ def visualize_training_sample(
         for p in range(phases):
             model_phase = (
             phase_ids[:, p]
-            if opt.cond_mode == "motionfilm" and not opt.no_phase_id
+            if opt.cond_mode in ("multiphase_motionfilm_no_traj", "motionfilm")
+            and not opt.no_phase_id
             else None
         )
             D, _ = model_forward(model, moving[:, p], fixed, score_cache[p], model_phase)
@@ -760,9 +772,12 @@ def train_motionfilm_step(
 
     L_z_acc   = (w * mc_acc.square().sum(dim=-1)).mean()
     L_dvf_acc = dvf_acc.abs().mean()
-    L_traj = opt.lambda_z_acc * L_z_acc + opt.lambda_dvf_acc * L_dvf_acc
-    if L_traj.requires_grad:
-        L_traj.backward()
+    if opt.cond_mode == "motionfilm":
+        L_traj = opt.lambda_z_acc * L_z_acc + opt.lambda_dvf_acc * L_dvf_acc
+        if L_traj.requires_grad:
+            L_traj.backward()
+    else:
+        L_traj = torch.zeros((), device=fixed.device)
 
     del mc_seq, dvf_seq, mc_acc, dvf_acc
 
@@ -805,8 +820,13 @@ def train():
     os.makedirs(opt.save_dir, exist_ok=True)
     print(f"[Mode] {opt.cond_mode} | save_dir={opt.save_dir}")
     print(
-        f"[Conditioning] use_motion_film={opt.cond_mode in ('pairwise_motionfilm', 'motionfilm')} | "
-        f"use_phase_embedding={opt.cond_mode == 'motionfilm' and not opt.no_phase_id}"
+        f"[Conditioning] use_motion_film={opt.cond_mode in ('pairwise_motionfilm', 'multiphase_motionfilm_no_traj', 'motionfilm')} | "
+        f"use_phase_embedding={opt.cond_mode in ('multiphase_motionfilm_no_traj', 'motionfilm') and not opt.no_phase_id}"
+    )
+    print(
+        f"[Trajectory] enabled={opt.cond_mode == 'motionfilm'} | "
+        f"effective_lambda_z_acc={opt.lambda_z_acc if opt.cond_mode == 'motionfilm' else 0.0} | "
+        f"effective_lambda_dvf_acc={opt.lambda_dvf_acc if opt.cond_mode == 'motionfilm' else 0.0}"
     )
 
     train_loader, val_loader, test_loader = make_loaders(opt)
@@ -829,7 +849,11 @@ def train():
         320 * 2,
         448 * 2,
         use_ldm=not opt.no_ldm,
-        use_motion_film=opt.cond_mode in ("pairwise_motionfilm", "motionfilm"),
+        use_motion_film=opt.cond_mode in (
+            "pairwise_motionfilm",
+            "multiphase_motionfilm_no_traj",
+            "motionfilm",
+        ),
     ).cuda()
     transform = SpatialTransform().cuda()
     for parameter in transform.parameters():
