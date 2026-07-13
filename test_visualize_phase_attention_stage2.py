@@ -1,8 +1,9 @@
 """Fair test and visualization for phase-attention stage-two ablation.
 
-Compares the frozen Pairwise MotionFiLM coarse output, the attention/residual
-refinement, and the budget-matched continued-training control. All three use
-the same test sequence and the same cached LDM pair features.
+Compares the original baseline, frozen Pairwise MotionFiLM coarse output,
+attention/residual refinement, residual-only refinement, and budget-matched
+continued-training control. Every model uses the same test sequence and the
+same cached LDM pair features.
 """
 
 import argparse
@@ -31,15 +32,24 @@ from utils.utils import SpatialTransform, jacobian_determinant_vxm
 
 
 MODEL_NAMES = (
+    "baseline",
     "coarse_pairwise",
     "attention_residual",
     "residual_only",
     "continued_control",
 )
+MODEL_LABELS = {
+    "baseline": "Baseline",
+    "coarse_pairwise": "Pairwise coarse",
+    "attention_residual": "Attention",
+    "residual_only": "Residual-only",
+    "continued_control": "Control",
+}
 
 
 def parse_args():
     parser = argparse.ArgumentParser()
+    parser.add_argument("--baseline_ckpt", required=True)
     parser.add_argument("--attention_ckpt", required=True)
     parser.add_argument("--residual_ckpt", required=True)
     parser.add_argument("--control_ckpt", required=True)
@@ -70,18 +80,30 @@ def parse_args():
     return parser.parse_args()
 
 
-def build_motionfilm_model(use_ldm):
+def build_registration_model(use_ldm, use_motion_film):
     return LDMMorph(
         128 * 2,
         192 * 2,
         320 * 2,
         448 * 2,
         use_ldm=use_ldm,
-        use_motion_film=True,
+        use_motion_film=use_motion_film,
     ).cuda()
 
 
+def extract_model_state(payload, path):
+    if not isinstance(payload, dict):
+        return payload
+    for key in ("model_state_dict", "state_dict"):
+        if key in payload:
+            return payload[key]
+    if payload and all(torch.is_tensor(value) for value in payload.values()):
+        return payload
+    raise ValueError(f"Cannot find a model state_dict in {path}")
+
+
 def load_models(args):
+    baseline_payload = torch.load(args.baseline_ckpt, map_location="cpu")
     attention_payload = torch.load(args.attention_ckpt, map_location="cpu")
     residual_payload = torch.load(args.residual_ckpt, map_location="cpu")
     control_payload = torch.load(args.control_ckpt, map_location="cpu")
@@ -92,7 +114,18 @@ def load_models(args):
     if control_payload.get("mode") != "continued_control":
         raise ValueError("--control_ckpt is not a continued_control checkpoint")
 
-    coarse = build_motionfilm_model(use_ldm=not args.no_ldm)
+    baseline = build_registration_model(
+        use_ldm=not args.no_ldm,
+        use_motion_film=False,
+    )
+    baseline.load_state_dict(
+        extract_model_state(baseline_payload, args.baseline_ckpt), strict=True
+    )
+
+    coarse = build_registration_model(
+        use_ldm=not args.no_ldm,
+        use_motion_film=True,
+    )
     coarse.load_state_dict(
         attention_payload["pairwise_model_state_dict"], strict=True
     )
@@ -119,7 +152,10 @@ def load_models(args):
         residual_payload["residual_only_state_dict"], strict=True
     )
 
-    control = build_motionfilm_model(use_ldm=not args.no_ldm)
+    control = build_registration_model(
+        use_ldm=not args.no_ldm,
+        use_motion_film=True,
+    )
     control.load_state_dict(control_payload["model_state_dict"], strict=True)
 
     residual_coarse_state = residual_payload["pairwise_model_state_dict"]
@@ -131,11 +167,12 @@ def load_models(args):
                 "same frozen Pairwise MotionFiLM state"
             )
 
-    for model in (coarse, refiner, residual_refiner, control):
+    for model in (baseline, coarse, refiner, residual_refiner, control):
         model.eval()
         for parameter in model.parameters():
             parameter.requires_grad_(False)
 
+    print(f"[Baseline] loaded {args.baseline_ckpt} | strict=True")
     print(
         f"[Attention] step={attention_payload.get('step')} "
         f"best_val={attention_payload.get('best_val_ncc')} | strict=True"
@@ -148,7 +185,7 @@ def load_models(args):
         f"[Residual-only] step={residual_payload.get('step')} "
         f"best_val={residual_payload.get('best_val_ncc')} | strict=True"
     )
-    return coarse, refiner, residual_refiner, control
+    return baseline, coarse, refiner, residual_refiner, control
 
 
 def jacobian_result(displacement):
@@ -194,6 +231,7 @@ def sequence_outputs(
     args,
     fixed,
     moving_sequence,
+    baseline,
     coarse,
     refiner,
     residual_refiner,
@@ -206,6 +244,8 @@ def sequence_outputs(
         for phase in range(NUM_PHASES)
     ]
 
+    baseline_dvfs = []
+    baseline_warped = []
     coarse_dvfs = []
     coarse_warped = []
     motion_codes = []
@@ -213,6 +253,9 @@ def sequence_outputs(
     control_warped = []
     for phase in range(NUM_PHASES):
         moving = moving_sequence[:, phase]
+        baseline_dvf, _ = model_forward(
+            baseline, moving, fixed, score_cache[phase], phase_id=None
+        )
         coarse_dvf, motion_code = model_forward(
             coarse, moving, fixed, score_cache[phase], phase_id=None
         )
@@ -221,12 +264,17 @@ def sequence_outputs(
         )
         if motion_code is None:
             raise RuntimeError("The coarse Pairwise MotionFiLM returned no motion code")
+        _, baseline_image = transform(
+            moving, baseline_dvf.permute(0, 2, 3, 1)
+        )
         _, coarse_image = transform(
             moving, coarse_dvf.permute(0, 2, 3, 1)
         )
         _, control_image = transform(
             moving, control_dvf.permute(0, 2, 3, 1)
         )
+        baseline_dvfs.append(baseline_dvf)
+        baseline_warped.append(baseline_image)
         coarse_dvfs.append(coarse_dvf)
         coarse_warped.append(coarse_image)
         motion_codes.append(motion_code)
@@ -276,6 +324,7 @@ def sequence_outputs(
         residual_only_residuals.append(residual)
 
     return {
+        "baseline": (baseline_dvfs, baseline_warped),
         "coarse_pairwise": (coarse_dvfs, coarse_warped),
         "attention_residual": (attention_dvfs, attention_warped),
         "residual_only": (residual_only_dvfs, residual_only_warped),
@@ -292,6 +341,7 @@ def sequence_outputs(
 def evaluate(
     args,
     dataset,
+    baseline,
     coarse,
     refiner,
     residual_refiner,
@@ -330,6 +380,7 @@ def evaluate(
             args,
             fixed,
             moving_sequence,
+            baseline,
             coarse,
             refiner,
             residual_refiner,
@@ -451,6 +502,9 @@ def paired_statistics(rows):
         (row["model"], row["slice_id"], row["phase"]): row for row in rows
     }
     comparisons = [
+        ("residual_only", "baseline"),
+        ("attention_residual", "baseline"),
+        ("coarse_pairwise", "baseline"),
         ("attention_residual", "residual_only"),
         ("attention_residual", "coarse_pairwise"),
         ("residual_only", "coarse_pairwise"),
@@ -513,23 +567,13 @@ def save_figures(args, figure_cache):
     for slice_id, cache in sorted(figure_cache.items()):
         fixed = cache["fixed"][0, 0].numpy()
         moving_sequence = cache["moving"]
-        rows = [
-            "Moving",
-            "Fixed",
-            "Coarse warped",
-            "Attention warped",
-            "Residual-only warped",
-            "Control warped",
-            "Coarse |F-W|",
-            "Attention |F-W|",
-            "Residual-only |F-W|",
-            "Control |F-W|",
-            "Coarse Jacobian",
-            "Attention Jacobian",
-            "Residual-only Jacobian",
-            "Control Jacobian",
-        ]
-        fig, axes = plt.subplots(len(rows), NUM_PHASES, figsize=(27, 36))
+        rows = ["Moving", "Fixed"]
+        rows += [f"{MODEL_LABELS[name]} warped" for name in MODEL_NAMES]
+        rows += [f"{MODEL_LABELS[name]} |F-W|" for name in MODEL_NAMES]
+        rows += [f"{MODEL_LABELS[name]} Jacobian" for name in MODEL_NAMES]
+        error_start = 2 + len(MODEL_NAMES)
+        jacobian_start = 2 + 2 * len(MODEL_NAMES)
+        fig, axes = plt.subplots(len(rows), NUM_PHASES, figsize=(27, 43))
         for phase in range(NUM_PHASES):
             moving = moving_sequence[0, phase, 0].numpy()
             warped = {
@@ -540,27 +584,18 @@ def save_figures(args, figure_cache):
                 name: jacobian_result(cache["outputs"][name][0][phase])["jacobian_map"]
                 for name in MODEL_NAMES
             }
-            images = [
-                moving,
-                fixed,
-                warped["coarse_pairwise"],
-                warped["attention_residual"],
-                warped["residual_only"],
-                warped["continued_control"],
-                np.abs(fixed - warped["coarse_pairwise"]),
-                np.abs(fixed - warped["attention_residual"]),
-                np.abs(fixed - warped["residual_only"]),
-                np.abs(fixed - warped["continued_control"]),
-            ]
+            images = [moving, fixed]
+            images += [warped[name] for name in MODEL_NAMES]
+            images += [np.abs(fixed - warped[name]) for name in MODEL_NAMES]
             for row_index, image in enumerate(images):
-                cmap = "gray" if row_index < 6 else "magma"
+                cmap = "gray" if row_index < error_start else "magma"
                 axes[row_index, phase].imshow(image, cmap=cmap)
             jac_limit = max(
                 1.0,
                 max(float(np.abs(value).max()) for value in jacobians.values()),
             )
             for offset, name in enumerate(MODEL_NAMES):
-                axes[10 + offset, phase].imshow(
+                axes[jacobian_start + offset, phase].imshow(
                     jacobians[name],
                     cmap="RdBu_r",
                     vmin=-jac_limit,
@@ -676,7 +711,7 @@ def main():
     seed_everything(args.seed + 1000)
 
     ldm_model = load_ldm(args.ldm_config, args.ldm_ckpt)
-    coarse, refiner, residual_refiner, control = load_models(args)
+    baseline, coarse, refiner, residual_refiner, control = load_models(args)
     transform = SpatialTransform().cuda().eval()
     for parameter in transform.parameters():
         parameter.requires_grad_(False)
@@ -691,6 +726,7 @@ def main():
     rows, figure_cache = evaluate(
         args,
         dataset,
+        baseline,
         coarse,
         refiner,
         residual_refiner,
