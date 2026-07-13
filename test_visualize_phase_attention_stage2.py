@@ -30,12 +30,18 @@ from train_multiphase_motionfilm import (
 from utils.utils import SpatialTransform, jacobian_determinant_vxm
 
 
-MODEL_NAMES = ("coarse_pairwise", "attention_residual", "continued_control")
+MODEL_NAMES = (
+    "coarse_pairwise",
+    "attention_residual",
+    "residual_only",
+    "continued_control",
+)
 
 
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--attention_ckpt", required=True)
+    parser.add_argument("--residual_ckpt", required=True)
     parser.add_argument("--control_ckpt", required=True)
     parser.add_argument("--ldm_config", required=True)
     parser.add_argument("--ldm_ckpt", required=True)
@@ -76,10 +82,13 @@ def build_motionfilm_model(use_ldm):
 
 
 def load_models(args):
-    attention_payload = torch.load(args.attention_ckpt, map_location="cuda")
-    control_payload = torch.load(args.control_ckpt, map_location="cuda")
+    attention_payload = torch.load(args.attention_ckpt, map_location="cpu")
+    residual_payload = torch.load(args.residual_ckpt, map_location="cpu")
+    control_payload = torch.load(args.control_ckpt, map_location="cpu")
     if attention_payload.get("mode") != "attention_residual":
         raise ValueError("--attention_ckpt is not an attention_residual checkpoint")
+    if residual_payload.get("mode") != "residual_only":
+        raise ValueError("--residual_ckpt is not a residual_only checkpoint")
     if control_payload.get("mode") != "continued_control":
         raise ValueError("--control_ckpt is not a continued_control checkpoint")
 
@@ -99,10 +108,30 @@ def load_models(args):
         attention_payload["attention_residual_state_dict"], strict=True
     )
 
+    residual_config = residual_payload.get("config", {})
+    residual_refiner = CrossPhaseAttentionResidual(
+        code_dim=16,
+        num_heads=int(residual_config.get("attention_heads", 4)),
+        hidden_channels=int(residual_config.get("residual_channels", 32)),
+        residual_size=int(residual_config.get("residual_size", 128)),
+    ).cuda()
+    residual_refiner.load_state_dict(
+        residual_payload["residual_only_state_dict"], strict=True
+    )
+
     control = build_motionfilm_model(use_ldm=not args.no_ldm)
     control.load_state_dict(control_payload["model_state_dict"], strict=True)
 
-    for model in (coarse, refiner, control):
+    residual_coarse_state = residual_payload["pairwise_model_state_dict"]
+    attention_coarse_state = attention_payload["pairwise_model_state_dict"]
+    for key in attention_coarse_state:
+        if not torch.equal(attention_coarse_state[key], residual_coarse_state[key]):
+            raise ValueError(
+                "Attention and residual-only checkpoints do not contain the "
+                "same frozen Pairwise MotionFiLM state"
+            )
+
+    for model in (coarse, refiner, residual_refiner, control):
         model.eval()
         for parameter in model.parameters():
             parameter.requires_grad_(False)
@@ -115,7 +144,11 @@ def load_models(args):
         f"[Control] step={control_payload.get('step')} "
         f"best_val={control_payload.get('best_val_ncc')} | strict=True"
     )
-    return coarse, refiner, control
+    print(
+        f"[Residual-only] step={residual_payload.get('step')} "
+        f"best_val={residual_payload.get('best_val_ncc')} | strict=True"
+    )
+    return coarse, refiner, residual_refiner, control
 
 
 def jacobian_result(displacement):
@@ -158,7 +191,15 @@ def write_csv(path, rows):
 
 
 def sequence_outputs(
-    args, fixed, moving_sequence, coarse, refiner, control, ldm_model, transform
+    args,
+    fixed,
+    moving_sequence,
+    coarse,
+    refiner,
+    residual_refiner,
+    control,
+    ldm_model,
+    transform,
 ):
     score_cache = [
         extract_pair_scores(ldm_model, moving_sequence[:, phase], fixed, args.t_enc)
@@ -215,17 +256,49 @@ def sequence_outputs(
         if attention_weights is None:
             attention_weights = weights
 
+    residual_only_dvfs = []
+    residual_only_warped = []
+    residual_only_residuals = []
+    for phase in range(NUM_PHASES):
+        refined_dvf, residual, _ = residual_refiner.refine_phase_residual_only(
+            moving=moving_sequence[:, phase],
+            fixed=fixed,
+            pairwise_warped=coarse_warped[phase],
+            pairwise_dvf=coarse_dvfs[phase],
+            motion_codes=motion_codes,
+            phase_index=phase,
+        )
+        _, refined_image = transform(
+            moving_sequence[:, phase], refined_dvf.permute(0, 2, 3, 1)
+        )
+        residual_only_dvfs.append(refined_dvf)
+        residual_only_warped.append(refined_image)
+        residual_only_residuals.append(residual)
+
     return {
         "coarse_pairwise": (coarse_dvfs, coarse_warped),
         "attention_residual": (attention_dvfs, attention_warped),
+        "residual_only": (residual_only_dvfs, residual_only_warped),
         "continued_control": (control_dvfs, control_warped),
-        "residuals": residuals,
+        "residuals": {
+            "attention_residual": residuals,
+            "residual_only": residual_only_residuals,
+        },
         "attention_weights": attention_weights,
     }
 
 
 @torch.no_grad()
-def evaluate(args, dataset, coarse, refiner, control, ldm_model, transform):
+def evaluate(
+    args,
+    dataset,
+    coarse,
+    refiner,
+    residual_refiner,
+    control,
+    ldm_model,
+    transform,
+):
     loader = Data.DataLoader(
         dataset,
         batch_size=args.bs,
@@ -259,6 +332,7 @@ def evaluate(args, dataset, coarse, refiner, control, ldm_model, transform):
             moving_sequence,
             coarse,
             refiner,
+            residual_refiner,
             control,
             ldm_model,
             transform,
@@ -294,8 +368,13 @@ def evaluate(args, dataset, coarse, refiner, control, ldm_model, transform):
                     "mean_dvf_px": jac["mean_dvf_px"],
                     "max_dvf_px": jac["max_dvf_px"],
                     "residual_abs": (
-                        float(outputs["residuals"][phase].abs().mean().item())
-                        if model_name == "attention_residual"
+                        float(
+                            outputs["residuals"][model_name][phase]
+                            .abs()
+                            .mean()
+                            .item()
+                        )
+                        if model_name in outputs["residuals"]
                         else 0.0
                     ),
                 }
@@ -372,7 +451,9 @@ def paired_statistics(rows):
         (row["model"], row["slice_id"], row["phase"]): row for row in rows
     }
     comparisons = [
+        ("attention_residual", "residual_only"),
         ("attention_residual", "coarse_pairwise"),
+        ("residual_only", "coarse_pairwise"),
         ("attention_residual", "continued_control"),
         ("continued_control", "coarse_pairwise"),
     ]
@@ -437,15 +518,18 @@ def save_figures(args, figure_cache):
             "Fixed",
             "Coarse warped",
             "Attention warped",
+            "Residual-only warped",
             "Control warped",
             "Coarse |F-W|",
             "Attention |F-W|",
+            "Residual-only |F-W|",
             "Control |F-W|",
             "Coarse Jacobian",
             "Attention Jacobian",
+            "Residual-only Jacobian",
             "Control Jacobian",
         ]
-        fig, axes = plt.subplots(len(rows), NUM_PHASES, figsize=(27, 29))
+        fig, axes = plt.subplots(len(rows), NUM_PHASES, figsize=(27, 36))
         for phase in range(NUM_PHASES):
             moving = moving_sequence[0, phase, 0].numpy()
             warped = {
@@ -461,20 +545,22 @@ def save_figures(args, figure_cache):
                 fixed,
                 warped["coarse_pairwise"],
                 warped["attention_residual"],
+                warped["residual_only"],
                 warped["continued_control"],
                 np.abs(fixed - warped["coarse_pairwise"]),
                 np.abs(fixed - warped["attention_residual"]),
+                np.abs(fixed - warped["residual_only"]),
                 np.abs(fixed - warped["continued_control"]),
             ]
             for row_index, image in enumerate(images):
-                cmap = "gray" if row_index < 5 else "magma"
+                cmap = "gray" if row_index < 6 else "magma"
                 axes[row_index, phase].imshow(image, cmap=cmap)
             jac_limit = max(
                 1.0,
                 max(float(np.abs(value).max()) for value in jacobians.values()),
             )
             for offset, name in enumerate(MODEL_NAMES):
-                axes[8 + offset, phase].imshow(
+                axes[10 + offset, phase].imshow(
                     jacobians[name],
                     cmap="RdBu_r",
                     vmin=-jac_limit,
@@ -495,9 +581,32 @@ def save_figures(args, figure_cache):
         fig.savefig(figure_path, dpi=130, bbox_inches="tight")
         plt.close(fig)
 
-        weights = cache["attention_weights"][0].mean(dim=0).numpy()
+        all_head_weights = cache["attention_weights"][0].numpy()
+        weights = all_head_weights.mean(axis=0)
+        np.save(
+            os.path.join(
+                figure_dir,
+                f"{args.split}_slice{slice_id:02d}_attention_weights.npy",
+            ),
+            all_head_weights,
+        )
+        np.savetxt(
+            os.path.join(
+                figure_dir,
+                f"{args.split}_slice{slice_id:02d}_attention_mean.csv",
+            ),
+            weights,
+            delimiter=",",
+        )
         fig, axis = plt.subplots(figsize=(7, 6))
-        image = axis.imshow(weights, cmap="viridis", vmin=0.0, vmax=1.0)
+        value_min = float(weights.min())
+        value_max = float(weights.max())
+        if value_max - value_min < 1e-8:
+            value_min -= 1e-8
+            value_max += 1e-8
+        image = axis.imshow(
+            weights, cmap="viridis", vmin=value_min, vmax=value_max
+        )
         axis.set_xticks(range(NUM_PHASES), range(1, NUM_PHASES + 1))
         axis.set_yticks(range(NUM_PHASES), range(1, NUM_PHASES + 1))
         axis.set_xlabel("Key/value phase")
@@ -509,8 +618,31 @@ def save_figures(args, figure_cache):
         )
         fig.savefig(attention_path, dpi=160, bbox_inches="tight")
         plt.close(fig)
+
+        head_count = all_head_weights.shape[0]
+        fig, axes = plt.subplots(1, head_count, figsize=(5 * head_count, 4.5))
+        axes = np.atleast_1d(axes)
+        for head, axis in enumerate(axes):
+            head_weights = all_head_weights[head]
+            image = axis.imshow(
+                head_weights,
+                cmap="viridis",
+                vmin=float(head_weights.min()),
+                vmax=float(head_weights.max()),
+            )
+            axis.set_title(f"Head {head + 1}")
+            axis.set_xticks(range(NUM_PHASES), range(1, NUM_PHASES + 1))
+            axis.set_yticks(range(NUM_PHASES), range(1, NUM_PHASES + 1))
+            fig.colorbar(image, ax=axis, fraction=0.046)
+        fig.suptitle(f"Slice {slice_id}: per-head cross-phase attention")
+        head_path = os.path.join(
+            figure_dir, f"{args.split}_slice{slice_id:02d}_attention_heads.png"
+        )
+        fig.savefig(head_path, dpi=150, bbox_inches="tight")
+        plt.close(fig)
         print(f"[Figure] {figure_path}")
         print(f"[Figure] {attention_path}")
+        print(f"[Figure] {head_path}")
 
 
 def print_summary(summary_rows, paired_results):
@@ -544,7 +676,7 @@ def main():
     seed_everything(args.seed + 1000)
 
     ldm_model = load_ldm(args.ldm_config, args.ldm_ckpt)
-    coarse, refiner, control = load_models(args)
+    coarse, refiner, residual_refiner, control = load_models(args)
     transform = SpatialTransform().cuda().eval()
     for parameter in transform.parameters():
         parameter.requires_grad_(False)
@@ -557,7 +689,14 @@ def main():
     )
     print(f"[Data] split={args.split} sequences={len(dataset)} pairs={len(dataset) * 9}")
     rows, figure_cache = evaluate(
-        args, dataset, coarse, refiner, control, ldm_model, transform
+        args,
+        dataset,
+        coarse,
+        refiner,
+        residual_refiner,
+        control,
+        ldm_model,
+        transform,
     )
     summary_rows = summaries(rows)
     phase_rows = phase_summaries(rows)

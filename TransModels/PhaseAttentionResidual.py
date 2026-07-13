@@ -67,8 +67,6 @@ class CrossPhaseAttentionResidual(nn.Module):
             motion_codes: [B, P, C], all phases from the same slice per B.
         """
         normalized = self.code_norm(motion_codes)
-        #weights表示当前相位作为query对别的相位的关注程度
-        #attended是加权融合别的相位信息后的新特征
         attended, weights = self.phase_attention(
             normalized,
             normalized,
@@ -76,27 +74,25 @@ class CrossPhaseAttentionResidual(nn.Module):
             need_weights=True,
             average_attn_weights=False,
         )
-        #最终上下文=当前phase原始运动特征+从其他phase加权融合后的特征
         context = motion_codes + attended
         context = context + self.context_ffn(self.context_norm(context))
         return context, weights
 
-    def refine_phase(
+    def phasewise_context(self, motion_codes):
+        """Transform each phase independently without cross-phase mixing."""
+        context = motion_codes
+        context = context + self.context_ffn(self.context_norm(context))
+        return context
+
+    def _refine_from_context(
         self,
         moving,
         fixed,
         pairwise_warped,
         pairwise_dvf,
-        motion_codes,
+        context,
         phase_index,
     ):
-        """Predict a small residual for one phase.
-
-        Attention is recomputed for each phase during training. This is cheap
-        for nine 16-D tokens and lets each phase backpropagate independently,
-        avoiding retention of nine image-loss graphs at once.
-        """
-        context, attention_weights = self.cross_phase_context(motion_codes)
         phase_context = context[:, phase_index]
 
         size = (self.residual_size, self.residual_size)
@@ -140,5 +136,56 @@ class CrossPhaseAttentionResidual(nn.Module):
             align_corners=True,
         )
         refined_dvf = pairwise_dvf + residual
+        return refined_dvf, residual
+
+    def refine_phase(
+        self,
+        moving,
+        fixed,
+        pairwise_warped,
+        pairwise_dvf,
+        motion_codes,
+        phase_index,
+    ):
+        """Predict a small residual for one phase.
+
+        Attention is recomputed for each phase during training. This is cheap
+        for nine 16-D tokens and lets each phase backpropagate independently,
+        avoiding retention of nine image-loss graphs at once.
+        """
+        context, attention_weights = self.cross_phase_context(motion_codes)
+        refined_dvf, residual = self._refine_from_context(
+            moving,
+            fixed,
+            pairwise_warped,
+            pairwise_dvf,
+            context,
+            phase_index,
+        )
         return refined_dvf, residual, attention_weights
 
+    def refine_phase_residual_only(
+        self,
+        moving,
+        fixed,
+        pairwise_warped,
+        pairwise_dvf,
+        motion_codes,
+        phase_index,
+    ):
+        """Predict a residual using only the current phase's own code.
+
+        The local encoder, phasewise FFN, context projection, and residual head
+        are identical to the attention model. Multi-head attention is the only
+        path bypassed by this ablation.
+        """
+        context = self.phasewise_context(motion_codes)
+        refined_dvf, residual = self._refine_from_context(
+            moving,
+            fixed,
+            pairwise_warped,
+            pairwise_dvf,
+            context,
+            phase_index,
+        )
+        return refined_dvf, residual, None

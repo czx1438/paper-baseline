@@ -7,6 +7,10 @@ attention_residual:
     Freeze every Pairwise MotionFiLM parameter and train only a lightweight
     cross-phase attention module plus a zero-initialized residual DVF head.
 
+residual_only:
+    Freeze the same Pairwise MotionFiLM model and train the same phasewise FFN,
+    local encoder, and residual head, while bypassing cross-phase attention.
+
 continued_control:
     Add no new module and continue updating Pairwise MotionFiLM for the same
     data exposure and optimizer-update budget.
@@ -45,7 +49,7 @@ from utils.utils import MSE, SpatialTransform
 parser = ArgumentParser()
 parser.add_argument(
     "--mode",
-    choices=["attention_residual", "continued_control"],
+    choices=["attention_residual", "residual_only", "continued_control"],
     required=True,
 )
 parser.add_argument("--pairwise_ckpt", required=True)
@@ -76,6 +80,9 @@ parser.add_argument("--attention_heads", type=int, default=4)
 parser.add_argument("--residual_channels", type=int, default=32)
 parser.add_argument("--residual_size", type=int, default=128)
 parser.add_argument("--no_ldm", action="store_true")
+
+
+REFINEMENT_MODES = {"attention_residual", "residual_only"}
 
 
 def load_pairwise_model(path, use_ldm=True):
@@ -193,7 +200,12 @@ def train_attention_sequence(
     residual_values = []
     metric_values = {key: [] for key in ["image", "latent", "smooth", "bend", "jac"]}
     for phase in range(NUM_PHASES):
-        refined_dvf, residual, _ = refiner.refine_phase(
+        refine_function = (
+            refiner.refine_phase
+            if opt.mode == "attention_residual"
+            else refiner.refine_phase_residual_only
+        )
+        refined_dvf, residual, _ = refine_function(
             moving=moving[:, phase],
             fixed=fixed,
             pairwise_warped=base_warped[phase],
@@ -330,7 +342,12 @@ def evaluate_sequence(
                 coarse_warped = warped
                 residual_values.append(0.0)
             else:
-                displacement, residual, _ = refiner.refine_phase(
+                refine_function = (
+                    refiner.refine_phase
+                    if opt.mode == "attention_residual"
+                    else refiner.refine_phase_residual_only
+                )
+                displacement, residual, _ = refine_function(
                     moving=moving_phase,
                     fixed=fixed,
                     pairwise_warped=base_warped[phase],
@@ -437,9 +454,14 @@ def checkpoint_payload(opt, model, refiner, step, best_val):
         "best_val_ncc": best_val,
         "config": vars(opt),
     }
-    if opt.mode == "attention_residual":
+    if opt.mode in REFINEMENT_MODES:
         payload["pairwise_model_state_dict"] = model.state_dict()
-        payload["attention_residual_state_dict"] = refiner.state_dict()
+        state_key = (
+            "attention_residual_state_dict"
+            if opt.mode == "attention_residual"
+            else "residual_only_state_dict"
+        )
+        payload[state_key] = refiner.state_dict()
     else:
         payload["model_state_dict"] = model.state_dict()
     return payload
@@ -447,11 +469,14 @@ def checkpoint_payload(opt, model, refiner, step, best_val):
 
 def restore_checkpoint(path, opt, model, refiner):
     payload = torch.load(path, map_location="cuda")
-    if opt.mode == "attention_residual":
+    if opt.mode in REFINEMENT_MODES:
         model.load_state_dict(payload["pairwise_model_state_dict"], strict=True)
-        refiner.load_state_dict(
-            payload["attention_residual_state_dict"], strict=True
+        state_key = (
+            "attention_residual_state_dict"
+            if opt.mode == "attention_residual"
+            else "residual_only_state_dict"
         )
+        refiner.load_state_dict(payload[state_key], strict=True)
     else:
         model.load_state_dict(payload["model_state_dict"], strict=True)
 
@@ -489,7 +514,7 @@ def train():
     latent_mse = MSE().loss
 
     refiner = None
-    if opt.mode == "attention_residual":
+    if opt.mode in REFINEMENT_MODES:
         freeze_model(base_model)
         refiner = CrossPhaseAttentionResidual(
             code_dim=16,
@@ -497,7 +522,15 @@ def train():
             hidden_channels=opt.residual_channels,
             residual_size=opt.residual_size,
         ).cuda()
-        trainable = list(refiner.parameters())
+        if opt.mode == "residual_only":
+            for parameter in refiner.code_norm.parameters():
+                parameter.requires_grad_(False)
+            for parameter in refiner.phase_attention.parameters():
+                parameter.requires_grad_(False)
+        trainable = [
+            parameter for parameter in refiner.parameters()
+            if parameter.requires_grad
+        ]
     else:
         base_model.train()
         for parameter in base_model.parameters():
@@ -524,7 +557,7 @@ def train():
     best_val = -float("inf")
 
     for step in range(1, opt.iteration + 1):
-        if opt.mode == "attention_residual":
+        if opt.mode in REFINEMENT_MODES:
             base_model.eval()
             refiner.train()
         else:
@@ -534,7 +567,7 @@ def train():
         for _ in range(opt.sequences_per_update):
             batch, iterator = next_cycling(iterator, train_loader)
             loss_scale = 1.0 / opt.sequences_per_update
-            if opt.mode == "attention_residual":
+            if opt.mode in REFINEMENT_MODES:
                 metrics = train_attention_sequence(
                     opt,
                     base_model,
@@ -625,4 +658,3 @@ def train():
 
 if __name__ == "__main__":
     train()
-
