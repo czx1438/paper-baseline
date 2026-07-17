@@ -1,0 +1,16 @@
+{
+  "ldm_config": "./configs/latent-diffusion/xcat_no_motion.yaml",
+  "ldm_ckpt": "./logs/2026-07-10T23-15-21_xcat-ldm-block0135_vq23/checkpoints/last.ckpt",
+  "data_root": "/root/autodl-tmp/LDM-Morph-main/LDM-Morph-main/xcat_data",
+  "split": "val",
+  "save_dir": "./logs/LDM_Feature_Audit_Heart",
+  "timesteps": "1,5,10,20,40",
+  "translations": "0,8;8,0;8,8;-8,0;0,-8",
+  "radii": "3,3,2,1",
+  "temperature": 0.1,
+  "channel_cap": 32,
+  "max_slices": 3,
+  "fg_thr": 0.05,
+  "seed": 42,
+  "num_workers": 0
+}

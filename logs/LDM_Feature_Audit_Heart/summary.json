@@ -1,0 +1,26 @@
+{
+  "best_single_scale": {
+    "timestep": 1,
+    "scale": 0,
+    "cases": 15,
+    "epe_px": 7.456534322102865,
+    "zero_offset_epe_px": 8.662741699796952,
+    "epe_gain_vs_zero": 1.2062073776940878,
+    "argmax_epe_px": 6.828871536254883,
+    "pck_4px": 0.10596869199847182,
+    "pck_8px": 0.5629793862501781,
+    "confidence": 0.04339171449343363,
+    "entropy": 0.9455439209938049,
+    "true_margin": -0.02087230564405521,
+    "alpha_bar": 0.9969944357872009,
+    "noise_std": 0.054823026300990285,
+    "snr": 331.716232027764
+  },
+  "interpretation": {
+    "epe_px": "Expected-offset endpoint error in original image pixels; lower is better.",
+    "epe_gain_vs_zero": "Positive means LDM matching beats predicting no displacement.",
+    "pck_4px": "Fraction of foreground queries within 4 pixels; higher is better.",
+    "true_margin": "True-offset correlation minus strongest alternative; positive is desirable.",
+    "entropy": "Normalized local match ambiguity; lower is more decisive."
+  }
+}
